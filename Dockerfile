@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN mkdir -p /run/sshd && chmod 755 /run/sshd && ssh-keygen -A
 
-# Cấu hình SSH
+# Cấu hình SSH chuẩn
 RUN sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
     && sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
@@ -16,8 +16,8 @@ RUN sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
 COPY ssh-user-config.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/ssh-user-config.sh
 
-# Railway sẽ tự cấp cổng qua biến $PORT, nhưng mình cứ EXPOSE sẵn cho chắc
+# Mở cả 2 cổng
 EXPOSE 22
-EXPOSE 443
+EXPOSE 80
 
 CMD ["/usr/local/bin/ssh-user-config.sh"]
