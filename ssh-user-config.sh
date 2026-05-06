@@ -1,31 +1,41 @@
 #!/bin/bash
 
-echo "--- DEBUG INFO START ---"
-echo "Current User: $(whoami)"
-echo "Checking SSH Config..."
-grep "PermitRootLogin" /etc/ssh/sshd_config
-grep "PasswordAuthentication" /etc/ssh/sshd_config
-echo "--- DEBUG INFO END ---"
+# 1. Đặt mật khẩu Root
+ROOT_PASSWORD=${ROOT_PASSWORD:-"root"}
+echo "root:$ROOT_PASSWORD" | chpasswd
+echo "✅ Password set for Root."
 
-# Đặt pass cho root
-if [ -n "$ROOT_PASSWORD" ]; then
-    echo "root:$ROOT_PASSWORD" | chpasswd
-    echo "✅ Root password has been set."
-else
-    echo "root:root" | chpasswd
-    echo "⚠️ ROOT_PASSWORD not set, using default 'root'."
-fi
+# 2. Tạo file log để hiển thị lên Web
+LOG_FILE="/var/log/ssh_web.log"
+touch $LOG_FILE
+chmod 644 $LOG_FILE
 
-# Cấu hình SSH Key nếu có
-if [ -n "$SSH_PUBLIC_KEY" ]; then
-    mkdir -p /root/.ssh
-    echo "$SSH_PUBLIC_KEY" > /root/.ssh/authorized_keys
-    chmod 700 /root/.ssh
-    chmod 600 /root/.ssh/authorized_keys
-    echo "✅ SSH Key added for root."
-fi
+# 3. Khởi động SSH Server (Chạy ngầm và ném log vào file)
+/usr/sbin/sshd -E $LOG_FILE
+echo "🚀 SSH Server started in background."
 
-echo "🚀 Starting SSH Server in Debug Mode..."
-# -D: Chạy không ngầm
-# -e: Xuất log ra stderr (hiển thị lên Railway Logs)
-exec /usr/sbin/sshd -D -e
+# 4. Tạo một trang HTML đơn giản để xem log
+cat <<EOF > index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSH Live Logs</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body { background: #1e1e1e; color: #00ff00; font-family: monospace; padding: 20px; }
+        h2 { color: #fff; border-bottom: 1px solid #444; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <h2>-- SSH REALTIME DEBUG LOGS --</h2>
+    <p>Status: Running | Root Pass: ${ROOT_PASSWORD}</p>
+    <pre>$(tail -n 50 $LOG_FILE)</pre>
+</body>
+</html>
+EOF
+
+echo "🌐 Web Log Server starting on port 80..."
+# 5. Chạy Web Server ở chế độ chính để giữ container không bị tắt
+# Cổng 80 sẽ giúp Railway Healthcheck luôn báo "Active"
+python3 -m http.server 80
