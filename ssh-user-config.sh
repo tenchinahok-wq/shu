@@ -1,22 +1,24 @@
 #!/bin/bash
 
-# 1. Thiết lập mật khẩu cho Root (Lấy từ biến ROOT_PASSWORD trên Railway)
+# 1. Đặt mật khẩu Root từ biến môi trường Railway
 if [ -n "$ROOT_PASSWORD" ]; then
     echo "root:$ROOT_PASSWORD" | chpasswd
-    echo "✅ Root password has been set."
+    echo "✅ Root password set successfully."
 else
-    echo "⚠️ WARNING: ROOT_PASSWORD is not set. Using default or no password."
+    # Nếu bạn quên đặt biến, nó sẽ lấy pass mặc định là 'root' để bạn không bị khóa
+    echo "root:root" | chpasswd
+    echo "⚠️ ROOT_PASSWORD not set, using default 'root'."
 fi
 
-# 2. Thiết lập SSH Public Key cho Root (Nếu bạn muốn dùng Key cho "ngọt")
+# 2. Cấu hình SSH Key nếu có (nhưng KHÔNG tắt password)
 if [ -n "$SSH_PUBLIC_KEY" ]; then
     mkdir -p /root/.ssh
     echo "$SSH_PUBLIC_KEY" > /root/.ssh/authorized_keys
     chmod 700 /root/.ssh
     chmod 600 /root/.ssh/authorized_keys
-    echo "✅ SSH Public Key has been configured for Root."
+    echo "✅ SSH Key added."
 fi
 
-# 3. Khởi động SSH Server ở chế độ không chạy ngầm để giữ Container sống
-echo "🚀 Starting SSH Server..."
+# 3. Khởi động SSH Server
+echo "🚀 SSH Server is starting on port 22..."
 exec /usr/sbin/sshd -D
