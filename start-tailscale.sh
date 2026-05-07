@@ -1,39 +1,45 @@
 #!/bin/bash
 
-echo "🚀 [SYSTEM] Đang khởi động dịch vụ..."
+echo "🚀 [SYSTEM] Đang khởi động hệ thống..."
 
-# Xóa các file rác cũ nếu có để tránh lỗi 'node not found'
-rm -rf /var/lib/tailscale/tailscaled.state
-
-# 1. Chạy SSH
+# 1. Khởi động SSH
 service ssh start
+echo "✅ SSH Service đã chạy."
 
-# 2. Khởi động Tailscale Daemon
+# 2. Khởi động Tailscale Daemon (Chế độ Userspace cho Cloud)
 tailscaled --tun=userspace-networking --socks5-server=localhost:1055 &
 
 # Đợi daemon sẵn sàng
-sleep 3
+sleep 5
 
 # 3. Đăng nhập Tailscale
-# Sử dụng --force-reauth để làm mới node nếu gặp lỗi 404
-if [ -n "$TAILSCALE_AUTH_KEY" ]; then
-    tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=shopee-server --accept-dns=false --force-reauth
-else
-    echo "❌ LỖI: Không tìm thấy TAILSCALE_AUTH_KEY"
+if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+    echo "❌ LỖI: Chưa có TAILSCALE_AUTH_KEY trong Variables!"
     exit 1
 fi
 
+echo "☁️  Đang kết nối vào mạng Tailscale..."
+tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=shopee-server --accept-dns=false --force-reauth
+
 echo "--------------------------------------"
-echo "✅ Kết nối Tailscale THÀNH CÔNG!"
-echo "🛠️  IP: $(tailscale ip -4)"
+echo "✅ HỆ THỐNG ĐÃ ONLINE!"
+echo "👤 User: shopee | Pass: shopee"
+echo "🔗 IP Tailscale: $(tailscale ip -4)"
+echo "🛠️  Nodejs: $(node -v) | Go: $(go version)"
 echo "--------------------------------------"
 
-# 4. Keep-alive (Fix Signal 15)
+# 4. FIX LỖI SIGNAL 15 & KEEP-ALIVE
 LISTENING_PORT=${PORT:-8080}
+echo "🌐 Đang duy trì cổng $LISTENING_PORT..."
+
+# Chạy web server ảo ở nền
 python3 -m http.server $LISTENING_PORT &
 
-# Vòng lặp giữ container không thoát
+# Vòng lặp vô tận tự gọi chính mình để không bị Railway tắt
 while true; do
-    sleep 60
-    echo "Hệ thống vẫn đang chạy: $(date)"
+    # Tự ping chính mình để tạo traffic giả
+    curl -s http://localhost:$LISTENING_PORT > /dev/null
+    echo "Hệ thống vẫn đang sống: $(date)"
+    # Nghỉ 30 giây trước khi ping lại
+    sleep 30
 done
