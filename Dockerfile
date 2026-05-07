@@ -1,4 +1,4 @@
-dockerfile
+
 FROM ubuntu:22.04
 
 # 1. Cài đặt các công cụ: Go, Node.js, Xvfb, Python và các thư viện hệ thống
