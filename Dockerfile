@@ -1,18 +1,24 @@
-FROM ubuntu:22.04
+FROM ubuntu:latest
 
-# 1. Cài đặt các công cụ: Go, Node.js, Xvfb, Python và các thư viện hệ thống
+# 1. Cài đặt các công cụ cơ bản
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     python3 python3-pip curl git sudo wget \
-    golang-go nodejs npm \
+    nodejs npm \
     xvfb libxi6 libgconf-2-4 \
     htop procps \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Cài đặt thư viện cho Bot Telegram và Monitoring (Bỏ cờ --break-system-packages cho Ubuntu 22.04)
+# 2. Cài đặt Go 1.23.2 (Bản mới nhất để hỗ trợ crypto/ecdh, slices...)
+RUN wget https://go.dev/dl/go1.23.2.linux-amd64.tar.gz && \
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.23.2.linux-amd64.tar.gz && \
+    rm go1.23.2.linux-amd64.tar.gz
+ENV PATH=$PATH:/usr/local/go/bin
+
+# 3. Cài đặt thư viện Python
 RUN pip3 install pyTelegramBotAPI flask psutil
 
-# 3. Tạo file bot.py trực tiếp
+# 4. Tạo script Bot điều khiển (Cập nhật kết quả vào tin nhắn cũ)
 RUN cat <<'EOF' > /bot.py
 import telebot
 import os, subprocess, time, psutil
@@ -38,6 +44,7 @@ def get_system_stats():
         uptime = "N/A"
     return cpu, ram, uptime
 
+# Cập nhật Dashboard (Tin nhắn theo dõi hệ thống)
 def update_dashboard(chat_id, message_id):
     while True:
         try:
@@ -45,11 +52,10 @@ def update_dashboard(chat_id, message_id):
             text = (
                 "🖥️ **HỆ THỐNG GIÁM SÁT REAL-TIME**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"📟 **CPU:** `{cpu}%`\n"
-                f"🧠 **RAM:** `{ram}%`\n"
-                f"⏱️ **{uptime}**\n"
+                f"📟 **CPU:** `{cpu}%`  |  🧠 **RAM:** `{ram}%`\n"
+                f"⏱️ **Uptime:** {uptime}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🕒 Cập nhật: `{time.strftime('%H:%M:%S')}`\n"
+                f"🕒 Cập nhật lúc: `{time.strftime('%H:%M:%S')}`\n"
                 "💬 *Gõ lệnh trực tiếp để thực thi*"
             )
             bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown")
@@ -70,24 +76,39 @@ def start(message):
 @bot.message_handler(func=lambda m: str(m.chat.id) == ADMIN_ID)
 def run_command(message):
     cmd = message.text
+    # 1. Xóa lệnh người dùng gửi để sạch UI
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except:
         pass
 
-    status_msg = bot.send_message(message.chat.id, f"⏳ Đang thực thi: `{cmd}`", parse_mode="Markdown")
+    # 2. Gửi tin nhắn trạng thái ban đầu
+    status_msg = bot.send_message(message.chat.id, f"⏳ Đang thực thi: `{cmd}`...", parse_mode="Markdown")
 
     try:
-        result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=60)
-        output = result.decode("utf-8") if result else "Thành công (Không có output)"
-        if len(output) > 3500:
-            output = output[:3500] + "\n[...Dữ liệu quá dài...]"
-        bot.edit_message_text(f"✅ `{cmd}`\n```\n{output}```", message.chat.id, status_msg.message_id, parse_mode="Markdown")
-    except subprocess.CalledProcessError as e:
-        err_out = e.output.decode() if e.output else str(e)
-        bot.edit_message_text(f"❌ Lỗi thực thi `{cmd}`:\n```\n{err_out}```", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+        # 3. Thực thi lệnh
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        
+        # Đợi lệnh chạy và lấy kết quả
+        output, _ = process.communicate(timeout=120)
+        output_str = output.decode("utf-8") if output else "Thành công (Không có output)"
+        
+        # Cắt ngắn nếu quá dài
+        if len(output_str) > 3800:
+            output_str = output_str[:3800] + "\n[...Dữ liệu quá dài...]"
+        
+        # 4. CẬP NHẬT KẾT QUẢ VÀO CHÍNH TIN NHẮN ĐÓ
+        bot.edit_message_text(
+            f"✅ **Lệnh:** `{cmd}`\n━━━━━━━━━━━━━━━━━━━━\n```\n{output_str}```", 
+            message.chat.id, 
+            status_msg.message_id, 
+            parse_mode="Markdown"
+        )
+    except subprocess.TimeoutExpired:
+        process.kill()
+        bot.edit_message_text(f"❌ Lỗi: Lệnh `{cmd}` bị quá tải (Timeout 120s)", message.chat.id, status_msg.message_id)
     except Exception as e:
-        bot.edit_message_text(f"❌ Lỗi hệ thống: `{str(e)}`", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+        bot.edit_message_text(f"❌ Lỗi khi chạy `{cmd}`:\n```\n{str(e)}```", message.chat.id, status_msg.message_id, parse_mode="Markdown")
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
