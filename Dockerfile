@@ -1,4 +1,4 @@
-# Giai đoạn 1: Build
+# Giai đoạn 1: Build nhị phân Go
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
@@ -6,7 +6,7 @@ WORKDIR /app
 RUN go mod init tele-ssh-bot && \
     go get gopkg.in/telebot.v3
 
-# Sử dụng mã nguồn đã fix lỗi chuỗi và logic
+# Sử dụng mã nguồn đã được bao bọc cực kỳ cẩn thận
 RUN cat <<'EOF' > main.go
 package main
 
@@ -51,16 +51,15 @@ func main() {
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
 
-	// 1. XỬ LÝ LƯU FILE (Tải về thư mục /app)
+	// 1. XỬ LÝ LƯU FILE (Tải về thư mục hiện tại)
 	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
 		if c.Sender().ID != adminID { return nil }
 		doc := c.Message().Document
-		// Lưu trực tiếp với tên file gốc
 		path := doc.FileName
 		if err := b.Download(&doc.File, path); err != nil {
 			return c.Reply("❌ Lỗi lưu file: " + err.Error())
 		}
-		return c.Reply(fmt.Sprintf("📥 Đã tải file: `%s` thành công!", path), telebot.ModeMarkdown)
+		return c.Reply("📥 Đã lưu file: `" + path + "`", telebot.ModeMarkdown)
 	})
 
 	// 2. XỬ LÝ NÚT DỪNG
@@ -72,52 +71,50 @@ func main() {
 				p := v.(*ProcessInfo)
 				p.mu.Lock()
 				if p.PID != 0 {
-					// Tiêu diệt toàn bộ nhóm tiến trình (Nuclear Kill)
 					syscall.Kill(-p.PID, syscall.SIGKILL)
 				}
 				p.mu.Unlock()
 				p.Cancel()
-				return c.Respond(&telebot.CallbackResponse{Text: "Lệnh đang được dừng..."})
+				return c.Respond(&telebot.CallbackResponse{Text: "Đang tiêu diệt tiến trình..."})
 			}
 		}
-		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh không còn hoạt động."})
+		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh không còn tồn tại."})
 	})
 
-	// 3. XỬ LÝ LỆNH ĐA LUỒNG
+	// 3. XỬ LÝ CHẠY LỆNH (ĐA LUỒNG)
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		if c.Sender().ID != adminID { return nil }
 		cmdStr := c.Text()
 		
-		msg, _ := b.Send(c.Chat(), "🚀 **Đang khởi tạo...**")
+		msg, _ := b.Send(c.Chat(), "⌛ Đang chuẩn bị lệnh...")
 
 		selector := &telebot.ReplyMarkup{}
 		btn := selector.Data("⛔ DỪNG LỆNH NÀY", "stop_"+strconv.Itoa(msg.ID))
 		selector.Inline(selector.Row(btn))
 		
-		b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), selector, telebot.ModeMarkdown)
+		b.Edit(msg, "🚀 **Exec:** `" + cmdStr + "`", selector, telebot.ModeMarkdown)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		p := &ProcessInfo{Ctx: ctx, Cancel: cancel, CmdStr: cmdStr}
 		procs.Store(msg.ID, p)
 
-		go func() {
-			defer procs.Delete(msg.ID)
+		go func(target *telebot.Message, info *ProcessInfo) {
+			defer procs.Delete(target.ID)
 			defer cancel()
 
-			// Sử dụng stdbuf để đẩy log real-time
-			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
+			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL " + info.CmdStr)
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			
 			stdout, _ := cmd.StdoutPipe()
 			cmd.Stderr = cmd.Stdout
 			if err := cmd.Start(); err != nil {
-				b.Edit(msg, "❌ Lỗi thực thi: "+err.Error())
+				b.Edit(target, "❌ Lỗi: " + err.Error())
 				return
 			}
 
-			p.mu.Lock()
-			p.PID = cmd.Process.Pid
-			p.mu.Unlock()
+			info.mu.Lock()
+			info.PID = cmd.Process.Pid
+			info.mu.Unlock()
 
 			scanner := bufio.NewScanner(stdout)
 			ticker := time.NewTicker(1500 * time.Millisecond)
@@ -125,10 +122,10 @@ func main() {
 
 			go func() {
 				for scanner.Scan() {
-					p.mu.Lock()
-					p.Lines = append(p.Lines, scanner.Text())
-					if len(p.Lines) > 12 { p.Lines = p.Lines[1:] }
-					p.mu.Unlock()
+					info.mu.Lock()
+					info.Lines = append(info.Lines, scanner.Text())
+					if len(info.Lines) > 12 { info.Lines = info.Lines[1:] }
+					info.mu.Unlock()
 				}
 			}()
 
@@ -137,14 +134,14 @@ func main() {
 				case <-ctx.Done():
 					goto end
 				case <-ticker.C:
-					p.mu.Lock()
-					if len(p.Lines) > 0 {
-						output := strings.Join(p.Lines, "\n")
-						// Dùng nháy ngược để tránh lỗi newline in string
-						b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n
-```", cmdStr, output), selector, telebot.ModeMarkdown)
+					info.mu.Lock()
+					if len(info.Lines) > 0 {
+						output := strings.Join(info.Lines, "\n")
+						// Dùng nháy ngược để an toàn tuyệt đối cho chuỗi nhiều dòng
+						b.Edit(target, "🚀 **Running:** `" + info.CmdStr + "`\n\n```text\n" + output + "\n
+```", selector, telebot.ModeMarkdown)
 					}
-					p.mu.Unlock()
+					info.mu.Unlock()
 					if cmd.ProcessState != nil { goto end }
 				}
 			}
@@ -152,19 +149,20 @@ func main() {
 			cmd.Wait()
 			status := "✅ Hoàn thành"
 			if ctx.Err() != nil { status = "🛑 Đã dừng" }
-			b.Edit(msg, fmt.Sprintf("%s: `%s`\n\n`Tiến trình đã kết thúc.`", status, cmdStr), telebot.ModeMarkdown)
-		}()
+			b.Edit(target, status + ": `" + info.CmdStr + "`\n\n`Tiến trình kết thúc.`", telebot.ModeMarkdown)
+		}(msg, p)
+
 		return nil
 	})
 
-	log.Println("Bot SSH Ultra is running...")
+	log.Println("Bot is running...")
 	b.Start()
 }
 EOF
 
 RUN go build -o bot main.go
 
-# Giai đoạn 2: Runtime
+# Giai đoạn 2: Runtime Ubuntu 24.04
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y ca-certificates coreutils curl wget git htop iputils-ping dnsutils net-tools && apt-get clean
 WORKDIR /app
