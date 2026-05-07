@@ -1,4 +1,4 @@
-```dockerfile
+
 # Sử dụng Ubuntu 24.04 làm nền tảng
 FROM ubuntu:24.04
 
@@ -115,4 +115,4 @@ EOF
 # 5. Lệnh khởi chạy bot
 CMD ["python", "bot.py"]
 
-```
+
