@@ -1,59 +1,86 @@
-FROM ubuntu:latest
+FROM ubuntu:22.04
 
-# 1. Cài đặt Python và các công cụ cần thiết
+# 1. Cài đặt Go, Node.js, Xvfb và các công cụ bổ trợ
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip curl git sudo \
+    python3 python3-pip curl git sudo wget \
+    golang-go nodejs npm \
+    xvfb libxi6 libgconf-2-4 \
+    htop procps \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Cài đặt thư viện Bot Telegram
-RUN pip3 install pyTelegramBotAPI flask --break-system-packages
+# 2. Cài đặt thư viện Bot
+RUN pip3 install pyTelegramBotAPI flask psutil --break-system-packages
 
-# 3. Tạo file bot.py trực tiếp
+# 3. Tạo file bot.py với tính năng Dashboard và Tự xóa tin nhắn
 RUN echo 'import telebot\n\
-import os\n\
-import subprocess\n\
+import os, subprocess, time, psutil\n\
 from flask import Flask\n\
 from threading import Thread\n\
 \n\
-# Lấy Token và ID Admin từ Variable Railway\n\
 TOKEN = os.getenv("TELEGRAM_TOKEN")\n\
-ADMIN_ID = os.getenv("ADMIN_ID") # Để chỉ mình bạn dùng được\n\
-\n\
+ADMIN_ID = os.getenv("ADMIN_ID")\n\
 bot = telebot.TeleBot(TOKEN)\n\
 app = Flask("")\n\
 \n\
 @app.route("/")\n\
-def home():\n\
-    return "Bot is Running!"\n\
+def home(): return "System Online"\n\
+\n\
+# Dashboard cập nhật liên tục\n\
+def update_dashboard(chat_id, message_id):\n\
+    while True:\n\
+        try:\n\
+            cpu = psutil.cpu_percent()\n\
+            ram = psutil.virtual_memory().percent\n\
+            uptime = subprocess.check_output("uptime -p", shell=True).decode("utf-8").strip()\n\
+            text = f"📊 **SYSTEM MONITOR**\\n"\\\n\
+                   f"━━━━━━━━━━━━━━━\\n"\\\n\
+                   f"🖥 CPU: {cpu}%\\n"\\\n\
+                   f"💾 RAM: {ram}%\\n"\\\n\
+                   f"⏱ {uptime}\\n"\\\n\
+                   f"🌐 Status: Online\\n"\\\n\
+                   f"━━━━━━━━━━━━━━━\\n"\\\n\
+                   f"🕒 Last Update: {time.strftime(\"%H:%M:%S\")}"\n\
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown")\n\
+        except: pass\n\
+        time.sleep(10)\n\
 \n\
 @bot.message_handler(commands=["start"])\n\
-def send_welcome(message):\n\
-    bot.reply_to(message, "🚀 Bot Remote Shell đã sẵn sàng! Gõ lệnh để thực thi.")\n\
+def start_monitor(message):\n\
+    sent = bot.send_message(message.chat.id, "📊 Đang khởi tạo Dashboard...")\n\
+    Thread(target=update_dashboard, args=(message.chat.id, sent.message_id)).start()\n\
 \n\
-@bot.message_handler(func=lambda message: str(message.chat.id) == ADMIN_ID)\n\
-def run_command(message):\n\
+@bot.message_handler(func=lambda m: str(m.chat.id) == ADMIN_ID)\n\
+def exec_command(message):\n\
+    cmd = message.text\n\
+    # Tự động xóa lệnh của người dùng sau khi nhận\n\
+    try: bot.delete_message(message.chat.id, message.message_id)\n\
+    except: pass\n\
+\n\
+    sent_res = bot.send_message(message.chat.id, f"⏳ Exec: `{cmd}`...", parse_mode="Markdown")\n\
     try:\n\
-        # Thực thi lệnh shell từ tin nhắn\n\
-        cmd = message.text\n\
-        result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)\n\
-        output = result.decode("utf-8")\n\
-        if not output:\n\
-            output = "Done (No output)"\n\
-        bot.reply_to(message, f"```\\n{output}```", parse_mode="Markdown")\n\
-    except Exception as e:\n\
-        bot.reply_to(message, f"❌ Lỗi: {str(e)}")\n\
-\n\
-def run_flask():\n\
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))\n\
-\n\
-if __name__ == "__main__":\n\
-    # Chạy Flask ở luồng riêng để Railway Healthcheck không báo lỗi\n\
-    Thread(target=run_flask).start()\n\
-    print("🤖 Bot đang lắng nghe...")\n\
-    bot.infinity_polling()' > /bot.py
+        res = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)\n\
+        output = res.decode("utf-8") if res else "Done (No output)"\n\
+        bot.edit_message_text(f"✅ `{cmd}`\\n
+http://googleusercontent.com/immersive_entry_chip/0
 
-# Railway dùng cổng 8080 cho Healthcheck
-EXPOSE 8080
+---
 
-CMD ["python3", "/bot.py"]
+### 🌟 Các tính năng mới được thêm vào:
+
+1.  **Dashboard "Như thật":** Khi bạn gõ `/start`, Bot sẽ gửi một tin nhắn Dashboard hiển thị % CPU, % RAM và Uptime. Tin nhắn này sẽ **tự động cập nhật 10 giây một lần** mà không tạo tin nhắn mới.
+2.  **Tự xóa lệnh (Clean UI):** Ngay khi bạn gửi một lệnh (ví dụ: `go version`), Bot sẽ xóa tin nhắn đó của bạn ngay lập tức để giữ khung chat sạch sẽ, chỉ còn lại kết quả trả về.
+3.  **Công cụ cài sẵn:**
+    * **Go:** Kiểm tra bằng `go version`.
+    * **Node.js:** Kiểm tra bằng `node -v`.
+    * **Xvfb:** Để bạn chạy các ứng dụng cần màn hình ảo (như trình duyệt ẩn danh).
+4.  **Giữ container sống:** Vòng lặp Dashboard và Flask server chạy song song giúp Railway luôn thấy container có "nhịp tim", tránh bị giết nhầm.
+
+### 🛠 Cách dùng:
+1.  Deploy lên Railway với 2 Variable: `TELEGRAM_TOKEN` và `ADMIN_ID`.
+2.  Mở Telegram, gõ `/start` để kích hoạt Dashboard.
+3.  Gõ thử: `node -v` hoặc `go version`. Bạn sẽ thấy tin nhắn của mình biến mất và thay bằng kết quả từ Bot.
+
+**Lưu ý về Xvfb:** Để dùng màn hình ảo, bạn hãy gõ lệnh theo cấu trúc: `xvfb-run <lệnh_của_bạn>`. Ví dụ: `xvfb-run node script.js`.
+
+Bản này là "đỉnh" nhất cho việc điều khiển Railway qua Telegram rồi đó! Thử ngay nhé.
