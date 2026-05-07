@@ -1,21 +1,39 @@
-# ... (Phần trên giữ nguyên đến đoạn tailscale up)
+#!/bin/bash
+
+echo "🚀 [SYSTEM] Đang khởi động dịch vụ..."
+
+# Xóa các file rác cũ nếu có để tránh lỗi 'node not found'
+rm -rf /var/lib/tailscale/tailscaled.state
+
+# 1. Chạy SSH
+service ssh start
+
+# 2. Khởi động Tailscale Daemon
+tailscaled --tun=userspace-networking --socks5-server=localhost:1055 &
+
+# Đợi daemon sẵn sàng
+sleep 3
+
+# 3. Đăng nhập Tailscale
+# Sử dụng --force-reauth để làm mới node nếu gặp lỗi 404
+if [ -n "$TAILSCALE_AUTH_KEY" ]; then
+    tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=shopee-server --accept-dns=false --force-reauth
+else
+    echo "❌ LỖI: Không tìm thấy TAILSCALE_AUTH_KEY"
+    exit 1
+fi
 
 echo "--------------------------------------"
 echo "✅ Kết nối Tailscale THÀNH CÔNG!"
-echo "🛠️  Nodejs: $(node -v) | Go: $(go version)"
-echo "🔗 IP Tailscale của bạn: $(tailscale ip -4)"
+echo "🛠️  IP: $(tailscale ip -4)"
 echo "--------------------------------------"
 
-# Thay thế đoạn python server bằng vòng lặp chống thoát và phản hồi Port
+# 4. Keep-alive (Fix Signal 15)
 LISTENING_PORT=${PORT:-8080}
-echo "🌐 Đang duy trì cổng $LISTENING_PORT cho Railway..."
-
-# Chạy một server web nền và giữ script chạy mãi mãi
 python3 -m http.server $LISTENING_PORT &
 
-# Vòng lặp vô tận để giữ container không bao giờ thoát
+# Vòng lặp giữ container không thoát
 while true; do
     sleep 60
-    # In ra log mỗi phút để Railway biết mình vẫn sống
     echo "Hệ thống vẫn đang chạy: $(date)"
 done
