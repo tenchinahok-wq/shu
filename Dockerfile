@@ -1,51 +1,49 @@
 FROM ubuntu:22.04
 
-# Chống treo khi cài đặt các gói
+# Chống treo khi cài đặt
 ENV DEBIAN_FRONTEND=noninteractive
 
 # -----------------------------
-# 1. Cài đặt các gói hệ thống & SSH
+# 1. Cài đặt Hệ thống & Công cụ (NodeJS, Go, SSH)
 # -----------------------------
 RUN apt update && apt install -y \
     openssh-server curl wget git unzip sudo python3 \
     build-essential ca-certificates \
     && mkdir /var/run/sshd
 
-# -----------------------------
-# 2. Cài đặt Node.js 20.x (LTS)
-# -----------------------------
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt install -y nodejs
+# Cài đặt Node.js 20.x
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt install -y nodejs
 
-# -----------------------------
-# 3. Cài đặt Golang (1.22.2)
-# -----------------------------
+# Cài đặt Golang 1.22.2
 RUN wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz \
     && tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz \
     && rm go1.22.2.linux-amd64.tar.gz
 ENV PATH=$PATH:/usr/local/go/bin
 
-# -----------------------------
-# 4. Cài đặt Cloudflared
-# -----------------------------
+# Cài đặt Cloudflared
 RUN curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
     && dpkg -i cloudflared.deb && rm cloudflared.deb
 
 # -----------------------------
-# 5. Cấu hình User & Bảo mật SSH
+# 2. Cấu hình Tài khoản & Quyền Cao Nhất
 # -----------------------------
-# User: trthaodev | Pass: thaodev@
-RUN useradd -m trthaodev && echo "trthaodev:thaodev@" | chpasswd && adduser trthaodev sudo
-RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+# Tạo user shopee với pass shopee
+RUN useradd -m -s /bin/bash shopee && echo "shopee:shopee" | chpasswd && adduser shopee sudo
+# Cấp quyền sudo không cần mật khẩu cho shopee
+RUN echo "shopee ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Cho phép Root login và Password Auth
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "root:shopee" | chpasswd
 
 # -----------------------------
-# 6. Chuẩn bị Script khởi động
+# 3. Khởi chạy
 # -----------------------------
 COPY start-cloudflare.sh /usr/local/bin/start-cloudflare.sh
 RUN chmod +x /usr/local/bin/start-cloudflare.sh
 
-# Mở các cổng cần thiết
-EXPOSE 8080 22 8888 80 443
+# Expose các port phổ biến
+EXPOSE 8080 22 8888 3000
 
 CMD ["/usr/local/bin/start-cloudflare.sh"]
