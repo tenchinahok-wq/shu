@@ -2,12 +2,12 @@ FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# 1. Cài đặt các gói cơ bản
+# 1. Cài đặt tools
 RUN apt-get update && \
     apt-get install -y wget curl git python3 openssh-server net-tools htop tmux && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Cài Go 1.24 vào /usr/local (Để dùng phân vùng overlay 951GB)
+# 2. Cài Go 1.24
 RUN wget -q https://go.dev/dl/go1.24.0.linux-amd64.tar.gz && \
     tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz && \
     rm go1.24.0.linux-amd64.tar.gz
@@ -24,7 +24,10 @@ RUN mkdir -p /var/run/sshd && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/UsePAM yes/UsePAM no/' /etc/ssh/sshd_config
 
-# 4. TẠO SCRIPT HEALTH CHECK (Để không bao giờ bị 404 hay lỗi dấu ngoặc)
+# 4. CHÌA KHÓA Ở ĐÂY: Tạo và chuyển vào thư mục /app TRƯỚC TIÊN
+WORKDIR /app
+
+# 5. Giờ thì ghi file thoải mái không bao giờ lỗi "Directory nonexistent"
 RUN echo "from http.server import BaseHTTPRequestHandler, HTTPServer\n\
 class HealthCheck(BaseHTTPRequestHandler):\n\
     def do_GET(self):\n\
@@ -34,17 +37,15 @@ class HealthCheck(BaseHTTPRequestHandler):\n\
     def log_message(self, format, *args): return\n\
 httpd = HTTPServer(('0.0.0.0', 8080), HealthCheck)\n\
 print('--- Health Check Server started on port 8080 ---')\n\
-httpd.serve_forever()" > /app/health.py
+httpd.serve_forever()" > health.py
 
-# 5. TẠO SCRIPT KHỞI ĐỘNG (ENTRYPOINT)
+# 6. Tạo script khởi động
 RUN echo "#!/bin/bash\n\
 echo 'root:1' | chpasswd\n\
 /usr/sbin/sshd\n\
 echo '--- SSH Server started on port 22 ---'\n\
-python3 /app/health.py" > /app/start.sh && chmod +x /app/start.sh
+python3 health.py" > start.sh && chmod +x start.sh
 
-WORKDIR /app
 EXPOSE 8080 22
 
-# 6. Lệnh chạy cuối cùng (Cực kỳ đơn giản, không lỗi cú pháp)
-CMD ["/app/start.sh"]
+CMD ["./start.sh"]
