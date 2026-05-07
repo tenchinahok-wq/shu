@@ -1,41 +1,34 @@
-FROM ubuntu:24.04
+FROM ubuntu:latest
 
-# Build-time only - prevents interactive prompts
-ARG DEBIAN_FRONTEND=noninteractive
+# 1. Cài đặt các thành phần cần thiết
+# Build-time only - ngăn các câu hỏi tương tác
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    python3 \
+    curl \
+    sudo \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 1. Cài đặt các gói cơ bản, SSH, NodeJS, Golang
-RUN apt-get update && apt-get upgrade -y && \
-    apt-get install -y wget curl git python3 python3-pip nodejs npm \
-    neofetch vim nano htop build-essential openssh-server sudo dos2unix iptables && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# 2. Cấu hình SSH Server
+RUN mkdir /var/run/sshd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config
 
-# 2. Cài đặt Golang 1.22.2 (Sẵn sàng cho dev)
-RUN wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && rm go1.22.2.linux-amd64.tar.gz
-ENV PATH=$PATH:/usr/local/go/bin
+# 3. Tạo script khởi động trực tiếp trong Dockerfile
+# Script này sẽ: gán pass, chạy SSH, và chạy web server giữ mạng
+RUN echo '#!/bin/bash\n\
+echo "root:${Password:-shopee}" | chpasswd\n\
+/usr/sbin/sshd\n\
+echo "------------------------------------------------"\n\
+echo "✅ SSH Server đang chạy tại cổng nội bộ 22"\n\
+echo "✅ Healthcheck đang chạy tại cổng ${PORT:-8080}"\n\
+echo "------------------------------------------------"\n\
+python3 -m http.server ${PORT:-8080}' > /start.sh && chmod +x /start.sh
 
-# 3. Cài đặt ttyd (Web Terminal)
-RUN wget -qO /bin/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && \
-    chmod +x /bin/ttyd
+# Railway dùng cổng 22 cho TCP Proxy và PORT (8080) cho HTTP
+EXPOSE 22 8080
 
-# 4. Cài đặt Tailscale
-RUN curl -fsSL https://tailscale.com/install.sh | sh
-
-# 5. Cấu hình SSH & Tài khoản shopee (Quyền cao nhất)
-RUN useradd -m -s /bin/bash shopee && echo "shopee:shopee" | chpasswd && adduser shopee sudo && \
-    echo "shopee ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
-    mkdir /var/run/sshd && \
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-# 6. Thiết lập bash và neofetch
-RUN echo "neofetch" >> /root/.bashrc && \
-    echo "neofetch" >> /home/shopee/.bashrc
-
-# 7. Copy script khởi động
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN dos2unix /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
-
-# Railway sẽ gán PORT tự động
-EXPOSE 8080 22
-
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Chạy script khi container khởi động
+CMD ["/start.sh"]
