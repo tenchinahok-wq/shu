@@ -1,4 +1,3 @@
-```dockerfile
 # Sử dụng Ubuntu 24.04 làm nền tảng
 FROM ubuntu:24.04
 
@@ -196,4 +195,3 @@ EOF
 # 4. Chạy bot ở chế độ Unbuffered
 CMD ["python3", "-u", "bot.py"]
 
-```
