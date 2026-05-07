@@ -1,13 +1,13 @@
-# Giai đoạn 1: Build Bot bằng Golang
+# Giai đoạn 1: Build nhị phân Go
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
 
-# 1. Khởi tạo module và cài đặt telebot v3
+# Khởi tạo module và cài đặt thư viện telebot v3
 RUN go mod init tele-ssh-bot && \
     go get gopkg.in/telebot.v3
 
-# 2. Tạo mã nguồn main.go trực tiếp (Xử lý Live Log, Stop, PTY)
+# Tạo mã nguồn main.go (Đã fix lỗi Types)
 RUN cat <<'EOF' > main.go
 package main
 
@@ -15,7 +15,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -29,36 +28,34 @@ import (
 )
 
 type BotState struct {
-	mu           sync.Mutex
-	CancelFunc   context.CancelFunc
-	LastMsgID    int
-	Lines        []string
-	CurrentCmd   string
-	IsRunning    bool
+	mu         sync.Mutex
+	CancelFunc context.CancelFunc
+	LastMsgID  int
+	Lines      []string
+	CurrentCmd string
+	IsRunning  bool
 }
 
 var (
-	token     = os.Getenv("TK")
+	token      = os.Getenv("TK")
 	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)
-	state     = &BotState{}
+	state      = &BotState{}
 )
 
 func main() {
 	if token == "" || adminID == 0 {
-		log.Fatal("LỖI: Chưa cấu hình biến TK hoặc ID!")
+		log.Fatal("LỖI: Thiếu biến môi trường TK hoặc ID!")
 	}
 
-	pref := telebot.Settings{
+	b, err := telebot.NewBot(telebot.Settings{
 		Token:  token,
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	}
-
-	b, err := telebot.NewBot(pref)
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Middleware kiểm tra quyền admin
+	// Middleware kiểm tra ID người gửi
 	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
@@ -68,46 +65,37 @@ func main() {
 		}
 	})
 
-	// Nút dừng lệnh
-	stopBtn := telebot.InlineButton{
-		Unique: "stop_cmd",
-		Text:   "⛔ DỪNG LỆNH NGAY (GO MODE)",
-	}
+	// Khởi tạo menu và nút bấm
+	selector := &telebot.ReplyMarkup{}
+	stopBtn := selector.Data("⛔ DỪNG LỆNH (GO MODE)", "stop_cmd")
+	selector.Inline(selector.Row(stopBtn))
 
-	// Xử lý khi nhấn nút Dừng
+	// Xử lý nút Dừng
 	b.Handle(&stopBtn, func(c telebot.Context) error {
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		if state.CancelFunc != nil {
+		if state.CancelFunc != nil && state.IsRunning {
 			state.CancelFunc()
 			state.IsRunning = false
-			return c.Edit("🛑 **Đã gửi tín hiệu giết tiến trình cưỡng bức!**", telebot.ModeMarkdown)
+			return c.Edit("🛑 **Đã gửi tín hiệu KILL sạch tiến trình!**", telebot.ModeMarkdown)
 		}
 		return c.Respond(&telebot.CallbackResponse{Text: "Không có lệnh nào đang chạy!"})
 	})
 
-	// Xử lý tin nhắn văn bản (Lệnh SSH)
+	// Xử lý Lệnh SSH
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		state.mu.Lock()
-		if state.IsRunning {
-			if state.CancelFunc != nil {
-				state.CancelFunc() // Tự động giết lệnh cũ nếu có lệnh mới
-			}
+		if state.IsRunning && state.CancelFunc != nil {
+			state.CancelFunc() // Tự động dừng lệnh cũ
 		}
 		state.mu.Unlock()
 
 		cmdStr := c.Text()
-		
-		// Xóa tin nhắn cũ cho sạch chat
-		if state.LastMsgID != 0 {
-			b.Delete(&telebot.Message{ID: state.LastMsgID, Chat: c.Chat()})
-		}
+		chat := c.Chat()
 
-		menu := &telebot.ReplyMarkup{}
-		menu.Inline(menu.Row(stopBtn))
+		// Gửi tin nhắn log ban đầu
+		msg, _ := b.Send(chat, fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Đang chuẩn bị luồng...`", cmdStr), telebot.ModeMarkdown, selector)
 
-		msg, _ := b.Send(c.Chat(), fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Đang chuẩn bị luồng dữ liệu...`", cmdStr), telebot.ModeMarkdown, menu)
-		
 		state.mu.Lock()
 		state.LastMsgID = msg.ID
 		state.Lines = []string{}
@@ -115,7 +103,6 @@ func main() {
 		state.IsRunning = true
 		state.mu.Unlock()
 
-		// Chạy lệnh với Context để có thể hủy bỏ
 		ctx, cancel := context.WithCancel(context.Background())
 		state.mu.Lock()
 		state.CancelFunc = cancel
@@ -124,23 +111,22 @@ func main() {
 		go func() {
 			defer cancel()
 			
-			// stdbuf -i0 -oL -eL: Ép Linux tắt buffer dòng
+			// Sử dụng stdbuf để xuất log ngay lập tức
 			shellCmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -i0 -oL -eL "+cmdStr)
-			shellCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Tạo group PID để kill sạch con cháu
+			shellCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Tạo Group ID để kill cả nhóm
 
 			stdout, _ := shellCmd.StdoutPipe()
 			shellCmd.Stderr = shellCmd.Stdout
 			
 			if err := shellCmd.Start(); err != nil {
-				b.Edit(msg, fmt.Sprintf("❌ Lỗi khởi động: %v", err))
+				b.Edit(msg, fmt.Sprintf("❌ Lỗi: %v", err))
 				return
 			}
 
 			reader := bufio.NewReader(stdout)
-			ticker := time.NewTicker(1200 * time.Millisecond)
-			defer ticker.Stop()
-
 			done := make(chan bool)
+			
+			// Luồng đọc log
 			go func() {
 				for {
 					line, err := reader.ReadString('\n')
@@ -157,12 +143,16 @@ func main() {
 				}
 			}()
 
+			ticker := time.NewTicker(1200 * time.Millisecond)
+			defer ticker.Stop()
 			lastContent := ""
+
 			for {
 				select {
 				case <-ctx.Done():
-					syscall.Kill(-shellCmd.Process.Pid, syscall.SIGKILL) // Kill sạch nhóm tiến trình
-					return
+					// Gửi SIGKILL vào Group ID (dấu trừ trước PID)
+					syscall.Kill(-shellCmd.Process.Pid, syscall.SIGKILL)
+					goto final
 				case <-done:
 					goto final
 				case <-ticker.C:
@@ -170,8 +160,7 @@ func main() {
 					if len(state.Lines) > 0 {
 						content := strings.Join(state.Lines, "\n")
 						if content != lastContent {
-							newText := fmt.Sprintf("🚀 **Running:** `%s`\n\n```text\n%s\n```", cmdStr, content)
-							b.Edit(msg, newText, telebot.ModeMarkdown, menu)
+							b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s`\n\n```text\n%s\n```", cmdStr, content), telebot.ModeMarkdown, selector)
 							lastContent = content
 						}
 					}
@@ -183,22 +172,25 @@ func main() {
 			shellCmd.Wait()
 			state.mu.Lock()
 			state.IsRunning = false
-			finalContent := strings.Join(state.Lines, "\n")
 			status := "✅ Hoàn thành"
 			if ctx.Err() != nil {
 				status = "🛑 Đã dừng"
 			}
-			b.Edit(msg, fmt.Sprintf("**%s:** `%s`\n\n```text\n%s\n```", status, cmdStr, finalContent), telebot.ModeMarkdown)
+			finalLog := strings.Join(state.Lines, "\n")
+			b.Edit(msg, fmt.Sprintf("**%s:** `%s`\n\n```text\n%s\n```", status, cmdStr, finalLog), telebot.ModeMarkdown)
 			state.mu.Unlock()
 		}()
 
 		return nil
 	})
 
-	// Xử lý tải file
+	// Xử lý nhận file
 	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
 		doc := c.Message().Document
-		b.Download(doc, doc.FileName)
+		err := b.Download(&doc.File, doc.FileName)
+		if err != nil {
+			return c.Reply("❌ Lỗi tải file: " + err.Error())
+		}
 		return c.Reply(fmt.Sprintf("📥 Đã tải file: `%s`", doc.FileName), telebot.ModeMarkdown)
 	})
 
@@ -207,22 +199,22 @@ func main() {
 }
 EOF
 
-# Compile mã nguồn sang file nhị phân
+# Thực hiện build
 RUN go build -o bot main.go
 
-# Giai đoạn 2: Runtime (Sử dụng Ubuntu 24.04 cho đầy đủ thư viện)
+# Giai đoạn 2: Ubuntu Runtime
 FROM ubuntu:24.04
 
-# Cài đặt các công cụ hệ thống cần thiết
+# Cài đặt công cụ hệ thống cần thiết cho lệnh SSH
 RUN apt-get update && apt-get install -y \
-    ca-certificates coreutils htop curl wget git \
+    ca-certificates coreutils curl wget git htop \
     iputils-ping dnsutils net-tools \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy file bot đã build từ stage builder
+# Copy file thực thi từ builder
 COPY --from=builder /app/bot .
 
-# Lệnh chạy
+# Khởi chạy bot
 CMD ["./bot"]
