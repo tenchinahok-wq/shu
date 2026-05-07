@@ -30,8 +30,8 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # --- CẤU HÌNH ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"
-ALLOWED_USER_ID = 123456789 # Thay bằng ID của bạn
+TOKEN = "8190267925:AAHHdE2YuYWd9PfPXIILlzP-KA0SmynGhsc"
+ALLOWED_USER_ID = 6974873344 # Thay bằng ID của bạn
 LOG_LIMIT = 10 
 
 # Lưu trữ trạng thái tin nhắn
