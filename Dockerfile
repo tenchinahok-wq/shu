@@ -7,7 +7,7 @@ WORKDIR /app
 RUN go mod init tele-ssh-bot && \
     go get gopkg.in/telebot.v3
 
-# Tạo mã nguồn main.go (Cơ chế Live Update + Nuclear Kill)
+# Tạo mã nguồn main.go
 RUN cat <<'EOF' > main.go
 package main
 
@@ -40,7 +40,7 @@ type ProcessInfo struct {
 var (
 	token      = os.Getenv("TK")
 	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)
-	activeProcs sync.Map // Map[int]*ProcessInfo (msgID -> Info)
+	activeProcs sync.Map // Map[int]*ProcessInfo (Key: MessageID)
 )
 
 func main() {
@@ -56,7 +56,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Middleware bảo mật
+	// Middleware bảo mật: Chỉ Admin mới dùng được
 	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
@@ -66,171 +66,134 @@ func main() {
 		}
 	})
 
-	// Xử lý nút dừng (Stop callback)
+	// XỬ LÝ NÚT DỪNG RIÊNG BIỆT
 	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
 		data := c.Callback().Data
 		if strings.HasPrefix(data, "stop_") {
-			msgID, _ := strconv.Atoi(strings.TrimPrefix(data, "stop_"))
+			msgIDStr := strings.TrimPrefix(data, "stop_")
+			msgID, _ := strconv.Atoi(msgIDStr)
+
 			if val, ok := activeProcs.Load(msgID); ok {
 				p := val.(*ProcessInfo)
 				p.mu.Lock()
 				if p.PID != 0 {
-					// NUCLEAR KILL: Giết cả group tiến trình
+					// Gửi tín hiệu SIGKILL cho toàn bộ Group ID
 					syscall.Kill(-p.PID, syscall.SIGKILL)
 				}
 				p.mu.Unlock()
-				p.Cancel()
-				activeProcs.Delete(msgID)
-				b.Edit(c.Message(), fmt.Sprintf("🛑 **Đã ép dừng:** `%s`", p.Command), telebot.ModeMarkdown)
-				return c.Respond(&telebot.CallbackResponse{Text: "Đã dừng ngay lập tức!"})
+				p.Cancel() // Hủy context của goroutine
+				
+				b.Edit(c.Message(), fmt.Sprintf("🛑 **ĐÃ DỪNG LỆNH:** `%s`", p.Command), telebot.ModeMarkdown)
+				return c.Respond(&telebot.CallbackResponse{Text: "Lệnh đã được tiêu diệt!"})
 			}
 		}
-		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh không còn tồn tại."})
+		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh này đã kết thúc từ trước."})
 	})
 
-	// Xử lý lệnh văn bản
+	// XỬ LÝ CHẠY LỆNH (ĐA LUỒNG)
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		cmdStr := c.Text()
 		chat := c.Chat()
 
-		// Gửi tin nhắn khởi tạo
-		msg, _ := b.Send(chat, fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Đang chuẩn bị...`", cmdStr), telebot.ModeMarkdown)
+		// Gửi tin nhắn trạng thái ban đầu
+		msg, _ := b.Send(chat, fmt.Sprintf("⌛ **Đang khởi tạo:** `%s`...", cmdStr), telebot.ModeMarkdown)
 		
-		// Tạo nút dừng riêng cho tin nhắn này
+		// Tạo nút dừng riêng cho Message ID này
 		selector := &telebot.ReplyMarkup{}
 		stopBtn := selector.Data("⛔ DỪNG LỆNH NÀY", "stop_"+strconv.Itoa(msg.ID))
 		selector.Inline(selector.Row(stopBtn))
-		
-		// Cập nhật để hiện nút bấm
-		b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Luồng dữ liệu đã sẵn sàng...`", cmdStr), telebot.ModeMarkdown, selector)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		pInfo := &ProcessInfo{
 			Ctx:     ctx,
 			Cancel:  cancel,
 			Command: cmdStr,
-			Lines:   []string{},
+			Lines:   make([]string, 0),
 		}
 		activeProcs.Store(msg.ID, pInfo)
 
-		go func() {
+		// Goroutine xử lý lệnh riêng biệt cho mỗi tin nhắn
+		go func(targetMsg *telebot.Message, info *ProcessInfo) {
 			defer cancel()
-			defer activeProcs.Delete(msg.ID)
+			defer activeProcs.Delete(targetMsg.ID)
 
-			// Khởi chạy với stdbuf để xóa buffer hệ thống
-			shellCmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -i0 -oL -eL "+cmdStr)
-			shellCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			// Sử dụng stdbuf để buộc flush log liên tục
+			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -i0 -oL -eL "+cmdStr)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Tạo Process Group mới
 
-			stdout, _ := shellCmd.StdoutPipe()
-			shellCmd.Stderr = shellCmd.Stdout
+			stdout, _ := cmd.StdoutPipe()
+			cmd.Stderr = cmd.Stdout // Gộp lỗi vào đầu ra chuẩn
 			
-			if err := shellCmd.Start(); err != nil {
-				b.Edit(msg, "❌ Lỗi: "+err.Error())
+			if err := cmd.Start(); err != nil {
+				b.Edit(targetMsg, "❌ Lỗi thực thi: "+err.Error())
 				return
 			}
 
-			pInfo.mu.Lock()
-			pInfo.PID = shellCmd.Process.Pid
-			pInfo.mu.Unlock()
+			info.mu.Lock()
+			info.PID = cmd.Process.Pid
+			info.mu.Unlock()
 
-			// Kênh thông báo có dòng log mới
-			logChan := make(chan string, 100)
-
-			// Goroutine đọc log từ Pipe
+			// Kênh nhận log từ scanner
+			logChan := make(chan string)
 			go func() {
 				scanner := bufio.NewScanner(stdout)
 				for scanner.Scan() {
-					txt := scanner.Text()
-					if txt != "" {
-						logChan <- txt
-					}
+					logChan <- scanner.Text()
 				}
+				close(logChan)
 			}()
 
-			ticker := time.NewTicker(1200 * time.Millisecond)
+			ticker := time.NewTicker(1500 * time.Millisecond) // Cập nhật mỗi 1.5s để tránh Telegram Rate Limit
 			defer ticker.Stop()
-
-			firstLineReceived := false
 
 			for {
 				select {
 				case <-ctx.Done():
-					// Kill khi nhận tín hiệu cancel
-					pInfo.mu.Lock()
-					if pInfo.PID != 0 {
-						syscall.Kill(-pInfo.PID, syscall.SIGKILL)
+					return // Kết thúc khi bị nhấn Stop hoặc lệnh xong
+				case line, ok := <-logChan:
+					if !ok {
+						goto finish // Hết dữ liệu để đọc
 					}
-					pInfo.mu.Unlock()
-					goto final
-				case line := <-logChan:
-					pInfo.mu.Lock()
-					pInfo.Lines = append(pInfo.Lines, line)
-					if len(pInfo.Lines) > 10 {
-						pInfo.Lines = pInfo.Lines[1:]
+					info.mu.Lock()
+					info.Lines = append(info.Lines, line)
+					if len(info.Lines) > 15 { // Chỉ giữ 15 dòng cuối cùng
+						info.Lines = info.Lines[1:]
 					}
-					
-					// NẾU LÀ DÒNG ĐẦU TIÊN: Cập nhật ngay lập tức không đợi ticker
-					if !firstLineReceived {
-						firstLineReceived = true
-						content := strings.Join(pInfo.Lines, "\n")
-						b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s`\n\n```text\n%s\n```", cmdStr, content), telebot.ModeMarkdown, selector)
-						pInfo.LastUpdate = time.Now()
-					}
-					pInfo.mu.Unlock()
-
+					info.mu.Unlock()
 				case <-ticker.C:
-					// Cập nhật định kỳ để tránh rate limit
-					pInfo.mu.Lock()
-					if len(pInfo.Lines) > 0 && time.Since(pInfo.LastUpdate) >= 1100*time.Millisecond {
-						content := strings.Join(pInfo.Lines, "\n")
-						b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s`\n\n```text\n%s\n```", cmdStr, content), telebot.ModeMarkdown, selector)
-						pInfo.LastUpdate = time.Now()
+					info.mu.Lock()
+					if len(info.Lines) > 0 {
+						content := strings.Join(info.Lines, "\n")
+						b.Edit(targetMsg, fmt.Sprintf("🚀 **Đang chạy:** `%s`\n\n```text\n%s\n
+```", cmdStr, content), telebot.ModeMarkdown, selector)
 					}
-					pInfo.mu.Unlock()
-					
-					if shellCmd.ProcessState != nil {
-						goto final
-					}
-				case <-time.After(500 * time.Millisecond):
-					// Check thoát tiến trình
-					if shellCmd.ProcessState != nil {
-						goto final
-					}
+					info.mu.Unlock()
 				}
 			}
 
-		final:
-			shellCmd.Wait()
-			pInfo.mu.Lock()
-			status := "✅ Hoàn thành"
+		finish:
+			cmd.Wait()
+			info.mu.Lock()
+			finalStatus := "✅ **Hoàn thành**"
 			if ctx.Err() != nil {
-				status = "🛑 Đã dừng"
+				finalStatus = "🛑 **Đã dừng**"
 			}
-			res := strings.Join(pInfo.Lines, "\n")
-			b.Edit(msg, fmt.Sprintf("**%s:** `%s`\n\n```text\n%s\n```", status, cmdStr, res), telebot.ModeMarkdown)
-			pInfo.mu.Unlock()
-		}()
+			finalLog := strings.Join(info.Lines, "\n")
+			b.Edit(targetMsg, fmt.Sprintf("%s: `%s`\n\n```text\n%s\n```", finalStatus, cmdStr, finalLog), telebot.ModeMarkdown)
+			info.mu.Unlock()
+		}(msg, pInfo)
 
 		return nil
 	})
 
-	// Xử lý nhận file
-	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
-		doc := c.Message().Document
-		if err := b.Download(&doc.File, doc.FileName); err != nil {
-			return c.Reply("❌ Lỗi tải file: " + err.Error())
-		}
-		return c.Reply(fmt.Sprintf("📥 Đã tải file: `%s`", doc.FileName), telebot.ModeMarkdown)
-	})
-
-	fmt.Printf("Bot Go SSH Ultra Live đang chạy cho ID: %d\n", adminID)
+	fmt.Printf("Bot SSH Multi-Thread đang chạy cho ID: %d\n", adminID)
 	b.Start()
 }
 EOF
 
 RUN go build -o bot main.go
 
-# Giai đoạn 2: Runtime Ubuntu 24.04
+# Giai đoạn 2: Runtime Ubuntu 24.04 nhẹ và mạnh
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y \
@@ -241,5 +204,4 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/bot .
 
-# Khởi chạy bot
 CMD ["./bot"]
