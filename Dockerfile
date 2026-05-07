@@ -1,35 +1,37 @@
 FROM ubuntu:24.04
 
+# Build-time only - ngăn các thông báo tương tác
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Cài đặt thêm openssh-server và telnetd
+# Cài đặt các công cụ cần thiết và OpenSSH Server
 RUN apt-get update && \
     apt-get upgrade -y && \
-    apt-get install -y wget curl git python3 python3-pip nodejs npm neofetch vim nano htop build-essential \
-    openssh-server telnetd sudo && \
+    apt-get install -y wget curl git python3 python3-pip nodejs npm neofetch vim nano htop build-essential openssh-server && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Cấu hình SSH để cho phép Root Login và mật khẩu
-RUN mkdir -p /run/sshd && \
-    ssh-keygen -A && \
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-    sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
+# Cấu hình SSH để cho phép đăng nhập root qua password
+RUN mkdir /var/run/sshd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Tải ttyd
+# Tải ttyd (Web Terminal)
 RUN wget -qO /bin/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && \
     chmod +x /bin/ttyd
 
-RUN echo "neofetch" >> /root/.bashrc
+# Cấu hình giao diện bash
+RUN echo "neofetch" >> /root/.bashrc && \
+    echo "cd /root" >> /root/.bashrc && \
+    echo "export PS1='\[\033[01;32m\]root@railway\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '" >> /root/.bashrc
 
-# Port 8080 cho Web (Railway sẽ tự map)
-EXPOSE 8080
-# Port 22 cho SSH
-EXPOSE 22
+# Mở port cho ttyd (8080) và SSH (22)
+EXPOSE 8080 22
 
-# Lệnh khởi động song song cả SSH và ttyd
 CMD ["/bin/bash", "-c", "\
-    echo \"root:$PASSWORD\" | chpasswd && \
+    # Set mật khẩu root là shopee
+    echo 'root:shopee' | chpasswd && \
+    \
+    # Khởi động SSH Server ngầm
     /usr/sbin/sshd && \
-    echo \"export PS1='\\[\\033[01;32m\\]root@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\" >> /root/.bashrc && \
-    /bin/ttyd -p ${PORT:-8080} -c ${USERNAME:-admin}:${PASSWORD:-admin} /bin/bash"]
+    \
+    # Chạy ttyd với user root và pass shopee
+    /bin/ttyd -p ${PORT:-8080} -c root:shopee /bin/bash"]
