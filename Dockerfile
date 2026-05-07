@@ -1,153 +1,150 @@
-# Sử dụng Node.js bản 20
-FROM node:20-slim
+# Sử dụng Ubuntu 24.04 làm gốc
+FROM ubuntu:24.04
 
-# Cài đặt các công cụ hệ thống cần thiết
+# Chế độ không tương tác để cài đặt nhanh
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 1. Cài đặt Python và các công cụ hệ thống cần thiết (Cực nhanh)
 RUN apt-get update && apt-get install -y \
+    python3 python3-pip python3-venv \
     curl wget git htop neofetch coreutils \
-    build-essential iputils-ping dnsutils net-tools vim \
+    build-essential iputils-ping dnsutils net-tools \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Khởi tạo project và cài đặt thư viện Telegraf
-RUN npm init -y && npm install telegraf
+# 2. Cài đặt thư viện Telegram (v21.0+)
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir python-telegram-bot --upgrade
 
-# Tạo file index.js trực tiếp bên trong Dockerfile
-RUN cat <<'EOF' > index.js
-const { Telegraf, Markup } = require('telegraf');
-const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
+# 3. Tạo file bot.py trực tiếp (Tối ưu Live Log & Stop Button)
+RUN cat <<'EOF' > /app/bot.py
+import asyncio
+import os
+import logging
+import time
+import signal
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-const bot = new Telegraf(process.env.TK);
-const ALLOWED_ID = process.env.ID;
-const LOG_LIMIT = 10;
+# Lấy cấu hình từ biến môi trường
+TOKEN = os.getenv("TK")
+try:
+    ID_STR = os.getenv("ID", "0")
+    ALLOWED_USER_ID = int(ID_STR) if ID_STR.isdigit() else 0
+except:
+    ALLOWED_USER_ID = 0
 
-let currentProcess = null;
-let lastMsgId = null;
-let logLines = [];
-let lastUpdateTime = 0;
+LOG_LIMIT = 10
 
-// Hàm cập nhật tin nhắn log lên Telegram
-async function updateLog(ctx, command, isFinal = false) {
-  const now = Date.now();
-  // Giới hạn 1.2 giây mỗi lần update để tránh bị Telegram chặn
-  if (!isFinal && now - lastUpdateTime < 1200) return;
-
-  const output = logLines.slice(-LOG_LIMIT).join('\n') || 'Đang chờ output...';
-  const status = isFinal ? '✅ Hoàn thành' : '🚀 Running';
-  const text = `**${status}:** \`${command}\`\n\n\`\`\`text\n${output}\n\`\`\``;
-
-  try {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      lastMsgId,
-      null,
-      text,
-      {
-        parse_mode: 'Markdown',
-        ...(!isFinal && Markup.inlineKeyboard([
-          Markup.button.callback('⛔ Dừng lệnh', 'stop_cmd')
-        ]))
-      }
-    );
-    lastUpdateTime = now;
-  } catch (e) {
-    // Bỏ qua lỗi nếu nội dung không đổi
-  }
+state = {
+    "process": None,
+    "last_msg_id": None,
+    "current_cmd": "",
+    "lines": []
 }
 
-// Xử lý lệnh văn bản
-bot.on('text', async (ctx) => {
-  if (ctx.from.id.toString() !== ALLOWED_ID.toString()) return;
+logging.basicConfig(level=logging.INFO)
 
-  if (currentProcess) {
-    return ctx.reply('⚠️ Có lệnh đang chạy. Hãy dừng nó trước.');
-  }
+async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not TOKEN or update.effective_user.id != ALLOWED_USER_ID:
+        return
 
-  const command = ctx.message.text;
-  logLines = [];
-  
-  // Xóa log cũ
-  if (lastMsgId) {
-    try { await ctx.deleteMessage(lastMsgId); } catch (e) {}
-  }
+    if state["process"] and state["process"].returncode is None:
+        await update.message.reply_text("⚠️ Lệnh cũ đang chạy. Hãy nhấn 'Dừng'!")
+        return
 
-  const msg = await ctx.reply(`🚀 **Đang chạy:** \`${command}\`\n\n\`Đang khởi động...\``, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([Markup.button.callback('⛔ Dừng lệnh', 'stop_cmd')])
-  });
-  
-  lastMsgId = msg.message_id;
+    cmd = update.message.text
+    chat_id = update.effective_chat.id
+    state["current_cmd"] = cmd
+    state["lines"] = []
 
-  // Chạy lệnh bằng spawn để lấy stream trực tiếp
-  // Sử dụng 'sh -c' để hỗ trợ các lệnh phức tạp
-  currentProcess = spawn('sh', ['-c', `stdbuf -i0 -oL -eL ${command}`], {
-    detached: true,
-    stdio: ['inherit', 'pipe', 'pipe']
-  });
+    # Xóa log cũ
+    if state["last_msg_id"]:
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=state["last_msg_id"])
+        except: pass
 
-  currentProcess.stdout.on('data', (data) => {
-    const str = data.toString().trim();
-    if (str) {
-      logLines.push(...str.split('\n'));
-      updateLog(ctx, command);
-    }
-  });
+    # Nút dừng lệnh (callback_data thay vì callback_query_data)
+    keyboard = [[InlineKeyboardButton("⛔ Dừng lệnh", callback_data="stop")]]
+    markup = InlineKeyboardMarkup(keyboard)
 
-  currentProcess.stderr.on('data', (data) => {
-    const str = data.toString().trim();
-    if (str) {
-      logLines.push(`[Error] ${str}`);
-      updateLog(ctx, command);
-    }
-  });
+    msg = await update.message.reply_text(f"🚀 **Exec:** `{cmd}`\n\n`Đang khởi tạo...`", parse_mode='Markdown', reply_markup=markup)
+    state["last_msg_id"] = msg.message_id
 
-  currentProcess.on('close', (code) => {
-    updateLog(ctx, command, true);
-    currentProcess = null;
-  });
-});
+    # Chạy lệnh với stdbuf để log chảy ra ngay lập tức
+    state["process"] = await asyncio.create_subprocess_shell(
+        f"stdbuf -i0 -oL -eL {cmd}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        preexec_fn=os.setsid
+    )
 
-// Xử lý nút dừng lệnh
-bot.action('stop_cmd', async (ctx) => {
-  if (currentProcess) {
-    try {
-      // Giết cả nhóm tiến trình
-      process.kill(-currentProcess.pid, 'SIGTERM');
-      await ctx.answerCbQuery('Đã gửi lệnh dừng.');
-    } catch (e) {
-      try { currentProcess.kill(); } catch (e2) {}
-      await ctx.answerCbQuery('Đang dừng tiến trình...');
-    }
-  } else {
-    await ctx.answerCbQuery('Không có lệnh nào đang chạy.');
-  }
-});
+    last_up = 0
+    while True:
+        line = await state["process"].stdout.readline()
+        if not line: break
+        
+        text = line.decode('utf-8', errors='replace').strip()
+        if text:
+            state["lines"].append(text)
+            if len(state["lines"]) > LOG_LIMIT: state["lines"].pop(0)
 
-// Xử lý tải file
-bot.on('document', async (ctx) => {
-  if (ctx.from.id.toString() !== ALLOWED_ID.toString()) return;
-  
-  const fileId = ctx.message.document.file_id;
-  const fileName = ctx.message.document.file_name;
-  const link = await ctx.telegram.getFileLink(fileId);
-  
-  const response = await fetch(link.href);
-  const buffer = await response.arrayBuffer();
-  fs.writeFileSync(path.join(__dirname, fileName), Buffer.from(buffer));
-  
-  ctx.reply(`📥 Đã tải file: \`${fileName}\` vào thư mục /app`, { parse_mode: 'Markdown' });
-});
+            # Cập nhật mỗi 1.2s để tránh bị Telegram chặn
+            now = time.time()
+            if now - last_up > 1.2:
+                log_content = "\n".join(state["lines"])
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=state["last_msg_id"],
+                        text=f"🚀 **Running:** `{cmd}`\n\n```text\n{log_content}\n```",
+                        parse_mode='Markdown', reply_markup=markup
+                    )
+                    last_up = now
+                except: pass
 
-bot.catch((err) => console.error('Bot Error:', err));
+    await state["process"].wait()
+    
+    # Kết thúc
+    final_log = "\n".join(state["lines"]) if state["lines"] else "No output."
+    status = "✅ Done" if state["process"].returncode == 0 else "🛑 Stopped"
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=state["last_msg_id"],
+            text=f"**{status}:** `{cmd}`\n\n```text\n{final_log}\n```",
+            parse_mode='Markdown'
+        )
+    except: pass
+    state["process"] = None
 
-bot.launch().then(() => console.log('Bot Node.js đang chạy...'));
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if state["process"] and state["process"].returncode is None:
+        try:
+            os.killpg(os.getpgid(state["process"].pid), signal.SIGTERM)
+            await query.edit_message_text(f"🛑 **Đã dừng:** `{state['current_cmd']}`", parse_mode='Markdown')
+        except: pass
 
-// Đóng bot an toàn khi container bị tắt
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    f = await update.message.document.get_file()
+    name = update.message.document.file_name
+    await f.download_to_drive(name)
+    await update.message.reply_text(f"📥 Đã lưu: `{name}`")
+
+def main():
+    if not TOKEN: return
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), run_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CallbackQueryHandler(stop_cmd, pattern="stop"))
+    print(f"Bot SSH Ubuntu đang chạy cho ID: {ALLOWED_USER_ID}")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
 EOF
 
-# Chạy bot
-CMD ["node", "index.js"]
+# 4. Lệnh chạy (Sử dụng python3 -u để không bị đệm log)
+CMD ["python3", "-u", "bot.py"]
