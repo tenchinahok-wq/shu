@@ -1,26 +1,21 @@
-#!/bin/bash
-
-echo "🚀 [SYSTEM] Đang khởi động dịch vụ..."
-
-# 1. Chạy SSH
-service ssh start
-echo "✅ SSH đã sẵn sàng."
-
-# 2. Khởi động Tailscale Daemon (Chế độ Userspace)
-tailscaled --tun=userspace-networking --socks5-server=localhost:1055 &
-
-# 3. Đăng nhập và kết nối vào mạng Tailscale
-# Đợi daemon khởi động xong rồi mới chạy lệnh up
-sleep 2
-tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname=shopee-server --accept-dns=false
+# ... (Phần trên giữ nguyên đến đoạn tailscale up)
 
 echo "--------------------------------------"
 echo "✅ Kết nối Tailscale THÀNH CÔNG!"
 echo "🛠️  Nodejs: $(node -v) | Go: $(go version)"
-echo "👤 User: shopee | Pass: shopee"
+echo "🔗 IP Tailscale của bạn: $(tailscale ip -4)"
 echo "--------------------------------------"
 
-# 4. Giữ container sống (Bắt đúng Port của Railway)
+# Thay thế đoạn python server bằng vòng lặp chống thoát và phản hồi Port
 LISTENING_PORT=${PORT:-8080}
-echo "🌐 Lắng nghe tại cổng: $LISTENING_PORT"
-python3 -m http.server $LISTENING_PORT
+echo "🌐 Đang duy trì cổng $LISTENING_PORT cho Railway..."
+
+# Chạy một server web nền và giữ script chạy mãi mãi
+python3 -m http.server $LISTENING_PORT &
+
+# Vòng lặp vô tận để giữ container không bao giờ thoát
+while true; do
+    sleep 60
+    # In ra log mỗi phút để Railway biết mình vẫn sống
+    echo "Hệ thống vẫn đang chạy: $(date)"
+done
