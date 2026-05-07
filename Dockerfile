@@ -1,4 +1,3 @@
-```dockerfile
 # Sử dụng Ubuntu 24.04 làm nền tảng
 FROM ubuntu:24.04
 
@@ -177,5 +176,3 @@ EOF
 
 # 4. Chạy Python ở chế độ Unbuffered để log hiện ra ngay
 CMD ["python3", "-u", "bot.py"]
-
-```
