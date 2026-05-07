@@ -1,171 +1,129 @@
-# Giai đoạn 1: Build nhị phân Go
-FROM golang:1.22-bookworm AS builder
-
+# Giai đoạn 1: Build
+FROM node:20-bookworm AS builder
 WORKDIR /app
 
-RUN go mod init tele-ssh-bot && \
-    go get gopkg.in/telebot.v3
+# Cài đặt thư viện
+RUN npm install telegraf axios
 
-# Sử dụng mã nguồn đã được bao bọc cực kỳ cẩn thận
-RUN cat <<'EOF' > main.go
-package main
+# Tạo mã nguồn index.js
+RUN cat <<'EOF' > index.js
+const { Telegraf, Markup } = require('telegraf');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const axios = require('axios');
+const path = require('path');
 
-import (
-	"bufio"
-	"context"
-	"fmt"
-	"log"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+const bot = new Telegraf(process.env.TK);
+const ADMIN_ID = parseInt(process.env.ID);
+const activeProcs = new Map(); // Lưu PID và dữ liệu theo message_id
 
-	"gopkg.in/telebot.v3"
-)
+// Middleware kiểm tra quyền Admin
+bot.use((ctx, next) => {
+    if (ctx.from && ctx.from.id === ADMIN_ID) return next();
+});
 
-type ProcessInfo struct {
-	Ctx    context.Context
-	Cancel context.CancelFunc
-	CmdStr string
-	Lines  []string
-	PID    int
-	mu     sync.Mutex
-}
+// 1. XỬ LÝ LƯU FILE
+bot.on('document', async (ctx) => {
+    try {
+        const fileId = ctx.message.document.file_id;
+        const fileName = ctx.message.document.file_name;
+        const link = await ctx.telegram.getFileLink(fileId);
+        
+        const response = await axios({ url: link.href, responseType: 'stream' });
+        response.data.pipe(fs.createWriteStream(path.join(__dirname, fileName)));
+        
+        ctx.reply(`📥 Đã lưu file: \`${fileName}\``, { parse_mode: 'Markdown' });
+    } catch (err) {
+        ctx.reply("❌ Lỗi lưu file: " + err.message);
+    }
+});
 
-var (
-	token      = os.Getenv("TK")
-	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)
-	procs      sync.Map
-)
+// 2. XỬ LÝ NÚT DỪNG
+bot.on('callback_query', (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (data.startsWith('stop_')) {
+        const msgId = data.split('_')[1];
+        const procInfo = activeProcs.get(parseInt(msgId));
+        
+        if (procInfo && procInfo.child) {
+            try {
+                // Nuclear Kill: Giết cả nhóm tiến trình
+                process.kill(-procInfo.child.pid, 'SIGKILL');
+                ctx.answerCbQuery("Đang dừng lệnh...");
+            } catch (e) {
+                ctx.answerCbQuery("Không thể dừng hoặc đã xong.");
+            }
+        } else {
+            ctx.answerCbQuery("Lệnh không còn tồn tại.");
+        }
+    }
+});
 
-func main() {
-	if token == "" || adminID == 0 {
-		log.Fatal("LỖI: Thiếu biến TK hoặc ID!")
-	}
+// 3. XỬ LÝ CHẠY LỆNH (ĐA LUỒNG)
+bot.on('text', async (ctx) => {
+    const cmdStr = ctx.message.text;
+    const msg = await ctx.reply(`🚀 **Exec:** \`${cmdStr}\``, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([Markup.button.callback('⛔ DỪNG LỆNH', `stop_${ctx.message.message_id + 1}`)])
+    });
 
-	b, _ := telebot.NewBot(telebot.Settings{
-		Token:  token,
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	})
+    // ID tin nhắn mà bot sẽ edit (thường là msg.message_id)
+    const targetMsgId = msg.message_id;
+    let logs = [];
+    
+    // Khởi chạy tiến trình
+    const child = spawn('sh', ['-c', `stdbuf -oL -eL ${cmdStr}`], {
+        detached: true, // Tạo process group riêng
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
 
-	// 1. XỬ LÝ LƯU FILE (Tải về thư mục hiện tại)
-	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
-		if c.Sender().ID != adminID { return nil }
-		doc := c.Message().Document
-		path := doc.FileName
-		if err := b.Download(&doc.File, path); err != nil {
-			return c.Reply("❌ Lỗi lưu file: " + err.Error())
-		}
-		return c.Reply("📥 Đã lưu file: `" + path + "`", telebot.ModeMarkdown)
-	})
+    activeProcs.set(targetMsgId, { child, logs });
 
-	// 2. XỬ LÝ NÚT DỪNG
-	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
-		data := c.Callback().Data
-		if strings.HasPrefix(data, "stop_") {
-			id, _ := strconv.Atoi(strings.TrimPrefix(data, "stop_"))
-			if v, ok := procs.Load(id); ok {
-				p := v.(*ProcessInfo)
-				p.mu.Lock()
-				if p.PID != 0 {
-					syscall.Kill(-p.PID, syscall.SIGKILL)
-				}
-				p.mu.Unlock()
-				p.Cancel()
-				return c.Respond(&telebot.CallbackResponse{Text: "Đang tiêu diệt tiến trình..."})
-			}
-		}
-		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh không còn tồn tại."})
-	})
+    child.stdout.on('data', (data) => {
+        logs.push(data.toString());
+        if (logs.length > 12) logs.shift();
+    });
 
-	// 3. XỬ LÝ CHẠY LỆNH (ĐA LUỒNG)
-	b.Handle(telebot.OnText, func(c telebot.Context) error {
-		if c.Sender().ID != adminID { return nil }
-		cmdStr := c.Text()
-		
-		msg, _ := b.Send(c.Chat(), "⌛ Đang chuẩn bị lệnh...")
+    child.stderr.on('data', (data) => {
+        logs.push(data.toString());
+        if (logs.length > 12) logs.shift();
+    });
 
-		selector := &telebot.ReplyMarkup{}
-		btn := selector.Data("⛔ DỪNG LỆNH NÀY", "stop_"+strconv.Itoa(msg.ID))
-		selector.Inline(selector.Row(btn))
-		
-		b.Edit(msg, "🚀 **Exec:** `" + cmdStr + "`", selector, telebot.ModeMarkdown)
+    // Cập nhật giao diện mỗi 1.5s
+    const ticker = setInterval(() => {
+        if (logs.length > 0) {
+            const output = logs.join('').trim();
+            ctx.telegram.editMessageText(ctx.chat.id, targetMsgId, null, 
+                `🚀 **Running:** \`${cmdStr}\` \n\n\`\`\`text\n${output}\n\`\`\``,
+                { 
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([Markup.button.callback('⛔ DỪNG LỆNH', `stop_${targetMsgId}`)])
+                }
+            ).catch(() => {});
+        }
+    }, 1500);
 
-		ctx, cancel := context.WithCancel(context.Background())
-		p := &ProcessInfo{Ctx: ctx, Cancel: cancel, CmdStr: cmdStr}
-		procs.Store(msg.ID, p)
+    const cleanup = (status) => {
+        clearInterval(ticker);
+        activeProcs.delete(targetMsgId);
+        ctx.telegram.editMessageText(ctx.chat.id, targetMsgId, null, 
+            `${status}: \`${cmdStr}\` \n\n\`Tiến trình kết thúc.\``, 
+            { parse_mode: 'Markdown' }
+        ).catch(() => {});
+    };
 
-		go func(target *telebot.Message, info *ProcessInfo) {
-			defer procs.Delete(target.ID)
-			defer cancel()
+    child.on('close', (code) => cleanup(code === 0 ? '✅ Hoàn thành' : '🛑 Đã dừng'));
+    child.on('error', (err) => cleanup('❌ Lỗi: ' + err.message));
+});
 
-			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL " + info.CmdStr)
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			
-			stdout, _ := cmd.StdoutPipe()
-			cmd.Stderr = cmd.Stdout
-			if err := cmd.Start(); err != nil {
-				b.Edit(target, "❌ Lỗi: " + err.Error())
-				return
-			}
-
-			info.mu.Lock()
-			info.PID = cmd.Process.Pid
-			info.mu.Unlock()
-
-			scanner := bufio.NewScanner(stdout)
-			ticker := time.NewTicker(1500 * time.Millisecond)
-			defer ticker.Stop()
-
-			go func() {
-				for scanner.Scan() {
-					info.mu.Lock()
-					info.Lines = append(info.Lines, scanner.Text())
-					if len(info.Lines) > 12 { info.Lines = info.Lines[1:] }
-					info.mu.Unlock()
-				}
-			}()
-
-			for {
-				select {
-				case <-ctx.Done():
-					goto end
-				case <-ticker.C:
-					info.mu.Lock()
-					if len(info.Lines) > 0 {
-						output := strings.Join(info.Lines, "\n")
-						// Dùng nháy ngược để an toàn tuyệt đối cho chuỗi nhiều dòng
-						b.Edit(target, "🚀 **Running:** `" + info.CmdStr + "`\n\n```text\n" + output + "\n
-```", selector, telebot.ModeMarkdown)
-					}
-					info.mu.Unlock()
-					if cmd.ProcessState != nil { goto end }
-				}
-			}
-			end:
-			cmd.Wait()
-			status := "✅ Hoàn thành"
-			if ctx.Err() != nil { status = "🛑 Đã dừng" }
-			b.Edit(target, status + ": `" + info.CmdStr + "`\n\n`Tiến trình kết thúc.`", telebot.ModeMarkdown)
-		}(msg, p)
-
-		return nil
-	})
-
-	log.Println("Bot is running...")
-	b.Start()
-}
+bot.launch();
+console.log("Bot Node.js đang chạy...");
 EOF
 
-RUN go build -o bot main.go
-
-# Giai đoạn 2: Runtime Ubuntu 24.04
+# Giai đoạn 2: Runtime
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y ca-certificates coreutils curl wget git htop iputils-ping dnsutils net-tools && apt-get clean
+RUN apt-get update && apt-get install -y nodejs npm ca-certificates coreutils curl wget git htop iputils-ping dnsutils net-tools && apt-get clean
 WORKDIR /app
-COPY --from=builder /app/bot .
-RUN chmod +x bot
-CMD ["./bot"]
+COPY --from=builder /app/index.js .
+COPY --from=builder /app/node_modules ./node_modules
+CMD ["node", "index.js"]
