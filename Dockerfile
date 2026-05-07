@@ -1,227 +1,160 @@
-# Giai đoạn 1: Build nhị phân Go
-FROM golang:1.22-bookworm AS builder
-
-WORKDIR /app
-
-# Khởi tạo module và cài đặt các thư viện cần thiết
-RUN go mod init tele-ssh-bot && \
-    go get gopkg.in/telebot.v3 && \
-    go get github.com/creack/pty
-
-# Tạo mã nguồn main.go
-RUN cat <<'EOF' > main.go
-package main
-
-import (
-	"bufio"
-	"context"
-	"fmt"
-	"log"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
-
-	"github.com/creack/pty"
-	"gopkg.in/telebot.v3"
-)
-
-type ProcessInfo struct {
-	Ctx        context.Context
-	Cancel     context.CancelFunc
-	Command    string
-	Lines      []string
-	PID        int
-	LastUpdate time.Time
-	mu         sync.Mutex
-}
-
-var (
-	token      = os.Getenv("TK")
-	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)
-	// Quản lý đa nhiệm: MsgID -> ProcessInfo
-	activeProcs sync.Map 
-)
-
-func main() {
-	if token == "" || adminID == 0 {
-		log.Fatal("LỖI: Cần biến TK và ID!")
-	}
-
-	b, err := telebot.NewBot(telebot.Settings{
-		Token:  token,
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Middleware bảo mật
-	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
-		return func(c telebot.Context) error {
-			if c.Sender().ID != adminID {
-				return nil
-			}
-			return next(c)
-		}
-	})
-
-	// Xử lý nút dừng lệnh (Lệnh nào dừng lệnh đó)
-	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
-		data := c.Callback().Data
-		if strings.HasPrefix(data, "stop_") {
-			msgID := strings.TrimPrefix(data, "stop_")
-			if val, ok := activeProcs.Load(msgID); ok {
-				p := val.(*ProcessInfo)
-				p.Cancel() // Hủy context
-				if p.PID != 0 {
-					// Kill cả nhóm tiến trình
-					syscall.Kill(-p.PID, syscall.SIGKILL)
-				}
-				activeProcs.Delete(msgID)
-				b.Edit(c.Message(), fmt.Sprintf("🛑 **Đã dừng lệnh:** `%s`", p.Command), telebot.ModeMarkdown)
-				return c.Respond(&telebot.CallbackResponse{Text: "Đã dừng!"})
-			}
-		}
-		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh đã kết thúc hoặc không tìm thấy!"})
-	})
-
-	// Xử lý chạy lệnh SSH
-	b.Handle(telebot.OnText, func(c telebot.Context) error {
-		cmdStr := c.Text()
-		
-		// Gửi tin nhắn khởi tạo
-		msg, err := b.Send(c.Chat(), fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Đang khởi tạo PTY...`", cmdStr), telebot.ModeMarkdown)
-		if err != nil {
-			return err
-		}
-
-		msgIDStr := strconv.Itoa(msg.ID)
-		
-		// Tạo menu nút dừng riêng cho tin nhắn này
-		selector := &telebot.ReplyMarkup{}
-		stopBtn := selector.Data("⛔ DỪNG LỆNH NÀY", "stop_"+msgIDStr)
-		selector.Inline(selector.Row(stopBtn))
-		
-		// Cập nhật tin nhắn để có nút bấm
-		b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`\n\n`Terminal đã sẵn sàng...`", cmdStr), telebot.ModeMarkdown, selector)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		pInfo := &ProcessInfo{
-			Ctx:     ctx,
-			Cancel:  cancel,
-			Command: cmdStr,
-			Lines:   []string{},
-		}
-		activeProcs.Store(msgIDStr, pInfo)
-
-		go func() {
-			defer cancel()
-			defer activeProcs.Delete(msgIDStr)
-
-			// Khởi chạy lệnh qua PTY để ép log ra ngay tắp lự
-			c := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-			c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-			f, err := pty.Start(c)
-			if err != nil {
-				b.Edit(msg, "❌ Lỗi PTY: "+err.Error())
-				return
-			}
-			defer f.Close()
-
-			pInfo.mu.Lock()
-			pInfo.PID = c.Process.Pid
-			pInfo.mu.Unlock()
-
-			// Luồng đọc log theo thời gian thực (đọc từng byte/dòng)
-			go func() {
-				scanner := bufio.NewScanner(f)
-				for scanner.Scan() {
-					text := scanner.Text()
-					if text == "" {
-						continue
-					}
-					pInfo.mu.Lock()
-					pInfo.Lines = append(pInfo.Lines, text)
-					if len(pInfo.Lines) > 10 {
-						pInfo.Lines = pInfo.Lines[1:]
-					}
-					pInfo.mu.Unlock()
-				}
-			}()
-
-			ticker := time.NewTicker(1200 * time.Millisecond)
-			defer ticker.Stop()
-			lastLog := ""
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					pInfo.mu.Lock()
-					if len(pInfo.Lines) > 0 {
-						currentLog := strings.Join(pInfo.Lines, "\n")
-						if currentLog != lastLog {
-							b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s`\n\n```text\n%s\n```", cmdStr, currentLog), telebot.ModeMarkdown, selector)
-							lastLog = currentLog
-						}
-					}
-					pInfo.mu.Unlock()
-					
-					// Kiểm tra nếu tiến trình đã thoát
-					if c.ProcessState != nil || c.Wait() == nil {
-						goto final
-					}
-				}
-			}
-
-		final:
-			pInfo.mu.Lock()
-			finalStatus := "✅ Hoàn thành"
-			if ctx.Err() != nil {
-				finalStatus = "🛑 Đã dừng"
-			}
-			res := strings.Join(pInfo.Lines, "\n")
-			b.Edit(msg, fmt.Sprintf("**%s:** `%s`\n\n```text\n%s\n```", finalStatus, cmdStr, res), telebot.ModeMarkdown)
-			pInfo.mu.Unlock()
-		}()
-
-		return nil
-	})
-
-	// Xử lý tải file
-	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
-		doc := c.Message().Document
-		if err := b.Download(&doc.File, doc.FileName); err != nil {
-			return c.Reply("❌ Lỗi: " + err.Error())
-		}
-		return c.Reply(fmt.Sprintf("📥 Đã tải file: `%s`", doc.FileName), telebot.ModeMarkdown)
-	})
-
-	fmt.Printf("Bot Go PTY (Multi-tasking) đang chạy cho ID: %d\n", adminID)
-	b.Start()
-}
-EOF
-
-# Build file nhị phân
-RUN go build -o bot main.go
-
-# Giai đoạn 2: Runtime
+# Sử dụng Ubuntu 24.04 để có đầy đủ công cụ hệ thống
 FROM ubuntu:24.04
 
-# Cài đặt các thư viện hệ thống cần thiết
+# Chế độ không tương tác
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 1. Cài đặt Node.js, Python (cho một số script) và các công cụ network
 RUN apt-get update && apt-get install -y \
-    ca-certificates coreutils curl wget git htop \
-    iputils-ping dnsutils net-tools \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    curl wget git htop neofetch coreutils \
+    build-essential iputils-ping dnsutils net-tools vim \
+    gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/bot .
 
-# Khởi chạy
-CMD ["./bot"]
+# 2. Khởi tạo dự án Node.js và cài đặt Telegraf
+RUN npm init -y && npm install telegraf
+
+# 3. Tạo file index.js (Logic đa nhiệm, Live Log, Hard Kill)
+RUN cat <<'EOF' > index.js
+const { Telegraf, Markup } = require('telegraf');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const bot = new Telegraf(process.env.TK);
+const ALLOWED_ID = process.env.ID;
+const LOG_LIMIT = 10;
+
+// Lưu trữ các tiến trình đang chạy: msgId -> { proc, lines, command, lastUpdate }
+const activeTasks = new Map();
+
+// Hàm cập nhật log lên Telegram
+async function sendUpdate(ctx, msgId, command, lines, isFinal = false) {
+    const task = activeTasks.get(msgId);
+    if (!task && !isFinal) return;
+
+    const now = Date.now();
+    // Giới hạn 1.2 giây/lần cập nhật để tránh rate limit của Telegram
+    if (!isFinal && task.lastUpdate && (now - task.lastUpdate < 1200)) return;
+
+    const output = lines.slice(-LOG_LIMIT).join('\n') || 'Đang chờ dữ liệu...';
+    const status = isFinal ? '✅ Hoàn thành' : '🚀 Running';
+    const text = `**${status}:** \`${command}\`\n\n\`\`\`text\n${output}\n\`\`\``;
+
+    try {
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            msgId,
+            null,
+            text,
+            {
+                parse_mode: 'Markdown',
+                ...(!isFinal && Markup.inlineKeyboard([
+                    [Markup.button.callback('⛔ DỪNG LỆNH NÀY', `stop_${msgId}`)]
+                ]))
+            }
+        );
+        if (task) task.lastUpdate = now;
+    } catch (e) {
+        // Bỏ qua lỗi nếu nội dung tin nhắn giống hệt cũ
+    }
+}
+
+// Xử lý khi nhận lệnh văn bản
+bot.on('text', async (ctx) => {
+    if (ctx.from.id.toString() !== ALLOWED_ID.toString()) return;
+
+    const command = ctx.message.text;
+    
+    // Gửi tin nhắn khởi tạo
+    const msg = await ctx.reply(`🚀 **Exec:** \`${command}\`\n\n\`Đang chuẩn bị...\``, {
+        parse_mode: 'Markdown'
+    });
+
+    const msgId = msg.message_id;
+    const lines = [];
+
+    // Chạy lệnh với stdbuf để xóa buffer hệ thống
+    // detached: true kết hợp với process.kill(-pid) để giết cả nhóm tiến trình con
+    const child = spawn('sh', ['-c', `stdbuf -i0 -oL -eL ${command}`], {
+        detached: true,
+        stdio: ['inherit', 'pipe', 'pipe']
+    });
+
+    activeTasks.set(msgId, { proc: child, lines, command, lastUpdate: 0 });
+
+    child.stdout.on('data', (data) => {
+        const str = data.toString().trim();
+        if (str) {
+            lines.push(...str.split('\n'));
+            if (lines.length > 50) lines.shift(); // Giữ tối đa 50 dòng trong RAM
+            sendUpdate(ctx, msgId, command, lines);
+        }
+    });
+
+    child.stderr.on('data', (data) => {
+        const str = data.toString().trim();
+        if (str) {
+            lines.push(`[Err] ${str}`);
+            sendUpdate(ctx, msgId, command, lines);
+        }
+    });
+
+    child.on('close', (code) => {
+        sendUpdate(ctx, msgId, command, lines, true);
+        activeTasks.delete(msgId);
+    });
+
+    child.on('error', (err) => {
+        ctx.reply(`❌ Lỗi hệ thống: ${err.message}`);
+        activeTasks.delete(msgId);
+    });
+});
+
+// Xử lý nút dừng lệnh (Chỉ dừng đúng lệnh của tin nhắn đó)
+bot.action(/^stop_(\m+)/, async (ctx) => {
+    const msgId = parseInt(ctx.match[1]);
+    const task = activeTasks.get(msgId);
+
+    if (task && task.proc) {
+        try {
+            // Giết cả nhóm tiến trình (Nuclear Option)
+            process.kill(-task.proc.pid, 'SIGKILL');
+            await ctx.answerCbQuery('🛑 Đã ép dừng lệnh!');
+        } catch (e) {
+            try { task.proc.kill('SIGKILL'); } catch (i) {}
+            await ctx.answerCbQuery('Đang dừng...');
+        }
+    } else {
+        await ctx.answerCbQuery('Lệnh đã kết thúc hoặc không tìm thấy.');
+    }
+});
+
+// Xử lý tải file trực tiếp
+bot.on('document', async (ctx) => {
+    if (ctx.from.id.toString() !== ALLOWED_ID.toString()) return;
+    
+    const fileId = ctx.message.document.file_id;
+    const fileName = ctx.message.document.file_name;
+    const link = await ctx.telegram.getFileLink(fileId);
+    
+    const response = await fetch(link.href);
+    const buffer = await response.arrayBuffer();
+    fs.writeFileSync(path.join(__dirname, fileName), Buffer.from(buffer));
+    
+    ctx.reply(`📥 Đã nhận file: \`${fileName}\` vào thư mục /app`, { parse_mode: 'Markdown' });
+});
+
+bot.launch().then(() => console.log('Bot Node.js SSH Ultra đang chạy...'));
+
+// Đóng bot an toàn
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+EOF
+
+# 4. Lệnh khởi chạy
+CMD ["node", "index.js"]
