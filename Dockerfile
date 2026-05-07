@@ -9,17 +9,16 @@ RUN apt-get update && apt-get install -y \
     htop procps \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Cài đặt thư viện cho Bot Telegram và Monitoring
-RUN pip3 install pyTelegramBotAPI flask psutil --break-system-packages
+# 2. Cài đặt thư viện cho Bot Telegram và Monitoring (Bỏ cờ --break-system-packages cho Ubuntu 22.04)
+RUN pip3 install pyTelegramBotAPI flask psutil
 
-# 3. Tạo file bot.py trực tiếp (Sử dụng cat để nội dung sạch sẽ nhất)
+# 3. Tạo file bot.py trực tiếp
 RUN cat <<'EOF' > /bot.py
 import telebot
 import os, subprocess, time, psutil
 from flask import Flask
 from threading import Thread
 
-# Lấy cấu hình từ Railway Variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
@@ -39,7 +38,6 @@ def get_system_stats():
         uptime = "N/A"
     return cpu, ram, uptime
 
-# Hàm cập nhật Dashboard tự động
 def update_dashboard(chat_id, message_id):
     while True:
         try:
@@ -72,24 +70,18 @@ def start(message):
 @bot.message_handler(func=lambda m: str(m.chat.id) == ADMIN_ID)
 def run_command(message):
     cmd = message.text
-    # 1. Tự động xóa tin nhắn lệnh của người dùng cho sạch UI
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except:
         pass
 
-    # 2. Thông báo đang thực thi
     status_msg = bot.send_message(message.chat.id, f"⏳ Đang thực thi: `{cmd}`", parse_mode="Markdown")
 
     try:
-        # Thực thi lệnh và lấy kết quả (Timeout 60s tránh treo bot)
         result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=60)
         output = result.decode("utf-8") if result else "Thành công (Không có output)"
-        
-        # Cắt ngắn nếu output quá dài
         if len(output) > 3500:
             output = output[:3500] + "\n[...Dữ liệu quá dài...]"
-        
         bot.edit_message_text(f"✅ `{cmd}`\n```\n{output}```", message.chat.id, status_msg.message_id, parse_mode="Markdown")
     except subprocess.CalledProcessError as e:
         err_out = e.output.decode() if e.output else str(e)
@@ -102,7 +94,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Chạy Web Server cho Railway Healthcheck ở luồng riêng
     Thread(target=run_flask, daemon=True).start()
     print("🤖 Bot Telegram Shell đang hoạt động...")
     bot.infinity_polling()
