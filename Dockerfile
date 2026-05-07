@@ -1,120 +1,178 @@
-# Giai đoạn 1: Build
+# Giai đoạn 1: Build nhị phân Go
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
 
-# Cài đặt thư viện cần thiết
+# Khởi tạo và cài đặt thư viện
 RUN go mod init tele-ssh-bot && \
     go get gopkg.in/telebot.v3
 
-# Sử dụng mã nguồn đã được fix lỗi cú pháp
-RUN echo 'package main\n\
-import (\n\
-	"bufio"\n\
-	"context"\n\
-	"fmt"\n\
-	"log"\n\
-	"os"\n\
-	"os/exec"\n\
-	"strconv"\n\
-	"strings"\n\
-	"sync"\n\
-	"syscall"\n\
-	"time"\n\
-	"gopkg.in/telebot.v3"\n\
-)\n\
-type ProcessInfo struct {\n\
-	Ctx    context.Context\n\
-	Cancel context.CancelFunc\n\
-	CmdStr string\n\
-	Lines  []string\n\
-	PID    int\n\
-	mu     sync.Mutex\n\
-}\n\
-var (\n\
-	token      = os.Getenv("TK")\n\
-	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)\n\
-	procs      sync.Map\n\
-)\n\
-func main() {\n\
-	b, _ := telebot.NewBot(telebot.Settings{\n\
-		Token:  token,\n\
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},\n\
-	})\n\
-	b.Handle(telebot.OnCallback, func(c telebot.Context) error {\n\
-		data := c.Callback().Data\n\
-		if strings.HasPrefix(data, "stop_") {\n\
-			id, _ := strconv.Atoi(strings.TrimPrefix(data, "stop_"))\n\
-			if v, ok := procs.Load(id); ok {\n\
-				p := v.(*ProcessInfo)\n\
-				p.mu.Lock()\n\
-				if p.PID != 0 { syscall.Kill(-p.PID, syscall.SIGKILL) }\n\
-				p.mu.Unlock()\n\
-				p.Cancel()\n\
-				b.Edit(c.Message(), "🛑 **Đã dừng:** `" + p.CmdStr + "`", telebot.ModeMarkdown)\n\
-			}\n\
-		}\n\
-		return c.Respond()\n\
-	})\n\
-	b.Handle(telebot.OnText, func(c telebot.Context) error {\n\
-		if c.Sender().ID != adminID { return nil }\n\
-		cmdStr := c.Text()\n\
-		msg, _ := b.Send(c.Chat(), "🚀 **Running:** `" + cmdStr + "`", telebot.ModeMarkdown)\n\
-		selector := &telebot.ReplyMarkup{}\n\
-		stopBtn := selector.Data("⛔ DỪNG", "stop_"+strconv.Itoa(msg.ID))\n\
-		selector.Inline(selector.Row(stopBtn))\n\
-		b.Edit(msg, "🚀 **Running:** `" + cmdStr + "`", selector, telebot.ModeMarkdown)\n\
-		ctx, cancel := context.WithCancel(context.Background())\n\
-		p := &ProcessInfo{Ctx: ctx, Cancel: cancel, CmdStr: cmdStr}\n\
-		procs.Store(msg.ID, p)\n\
-		go func() {\n\
-			defer procs.Delete(msg.ID)\n\
-			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL " + cmdStr)\n\
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}\n\
-			stdout, _ := cmd.StdoutPipe()\n\
-			cmd.Stderr = cmd.Stdout\n\
-			if err := cmd.Start(); err != nil { return }\n\
-			p.mu.Lock()\n\
-			p.PID = cmd.Process.Pid\n\
-			p.mu.Unlock()\n\
-			scanner := bufio.NewScanner(stdout)\n\
-			ticker := time.NewTicker(1500 * time.Millisecond)\n\
-			defer ticker.Stop()\n\
-			go func() {\n\
-				for scanner.Scan() {\n\
-					p.mu.Lock()\n\
-					p.Lines = append(p.Lines, scanner.Text())\n\
-					if len(p.Lines) > 10 { p.Lines = p.Lines[1:] }\n\
-					p.mu.Unlock()\n\
-				}\n\
-			}()\n\
-			for {\n\
-				select {\n\
-				case <-ctx.Done():\n\
-					return\n\
-				case <-ticker.C:\n\
-					p.mu.Lock()\n\
-					output := strings.Join(p.Lines, "\\n")\n\
-					b.Edit(msg, "🚀 **Running:** `" + cmdStr + "`\\n\\n```\\n" + output + "\\n
-```", selector, telebot.ModeMarkdown)\n\
-					p.mu.Unlock()\n\
-					if cmd.ProcessState != nil { goto end }\n\
-				}\n\
-			}\n\
-			end: \n\
-			cmd.Wait()\n\
-			b.Edit(msg, "✅ **Xong:** `" + cmdStr + "`", telebot.ModeMarkdown)\n\
-		}()\n\
-		return nil\n\
-	})\n\
-	b.Start()\n\
-}' > main.go
+# Tạo mã nguồn main.go (Sử dụng 'EOF' để tránh lỗi ký tự đặc biệt)
+RUN cat <<'EOF' > main.go
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"gopkg.in/telebot.v3"
+)
+
+type ProcessInfo struct {
+	Ctx     context.Context
+	Cancel  context.CancelFunc
+	CmdStr  string
+	Lines   []string
+	PID     int
+	mu      sync.Mutex
+}
+
+var (
+	token      = os.Getenv("TK")
+	adminID, _ = strconv.ParseInt(os.Getenv("ID"), 10, 64)
+	activeProcs sync.Map // Map[int]*ProcessInfo (Key là msgID)
+)
+
+func main() {
+	if token == "" || adminID == 0 {
+		log.Fatal("Thiếu TK hoặc ID!")
+	}
+
+	b, err := telebot.NewBot(telebot.Settings{
+		Token:  token,
+		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Xử lý nút dừng riêng biệt cho từng msgID
+	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		data := c.Callback().Data
+		if strings.HasPrefix(data, "stop_") {
+			msgID, _ := strconv.Atoi(strings.TrimPrefix(data, "stop_"))
+			if val, ok := activeProcs.Load(msgID); ok {
+				p := val.(*ProcessInfo)
+				p.mu.Lock()
+				if p.PID != 0 {
+					// Tiêu diệt cả Process Group (bao gồm lệnh con)
+					syscall.Kill(-p.PID, syscall.SIGKILL)
+				}
+				p.mu.Unlock()
+				p.Cancel()
+				b.Edit(c.Message(), fmt.Sprintf("🛑 **Đã dừng:** `%s`", p.CmdStr), telebot.ModeMarkdown)
+				return c.Respond(&telebot.CallbackResponse{Text: "Đã dừng ngay lập tức!"})
+			}
+		}
+		return c.Respond(&telebot.CallbackResponse{Text: "Lệnh không còn tồn tại."})
+	})
+
+	b.Handle(telebot.OnText, func(c telebot.Context) error {
+		if c.Sender().ID != adminID {
+			return nil
+		}
+
+		cmdStr := c.Text()
+		msg, _ := b.Send(c.Chat(), fmt.Sprintf("🚀 **Exec:** `%s`...", cmdStr), telebot.ModeMarkdown)
+
+		// Nút dừng định danh theo msg.ID
+		selector := &telebot.ReplyMarkup{}
+		stopBtn := selector.Data("⛔ DỪNG LỆNH NÀY", "stop_"+strconv.Itoa(msg.ID))
+		selector.Inline(selector.Row(stopBtn))
+		b.Edit(msg, fmt.Sprintf("🚀 **Running:** `%s`", cmdStr), telebot.ModeMarkdown, selector)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		pInfo := &ProcessInfo{Ctx: ctx, Cancel: cancel, CmdStr: cmdStr}
+		activeProcs.Store(msg.ID, pInfo)
+
+		go func(target *telebot.Message, info *ProcessInfo) {
+			defer cancel()
+			defer activeProcs.Delete(target.ID)
+
+			// stdbuf -oL giúp đẩy log ra ngay lập tức
+			cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+info.CmdStr)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			
+			stdout, _ := cmd.StdoutPipe()
+			cmd.Stderr = cmd.Stdout
+
+			if err := cmd.Start(); err != nil {
+				b.Edit(target, "❌ Lỗi: "+err.Error())
+				return
+			}
+
+			info.mu.Lock()
+			info.PID = cmd.Process.Pid
+			info.mu.Unlock()
+
+			scanner := bufio.NewScanner(stdout)
+			ticker := time.NewTicker(1500 * time.Millisecond)
+			defer ticker.Stop()
+
+			go func() {
+				for scanner.Scan() {
+					info.mu.Lock()
+					info.Lines = append(info.Lines, scanner.Text())
+					if len(info.Lines) > 10 {
+						info.Lines = info.Lines[1:]
+					}
+					info.mu.Unlock()
+				}
+			}()
+
+			for {
+				select {
+				case <-ctx.Done():
+					goto end
+				case <-ticker.C:
+					info.mu.Lock()
+					if len(info.Lines) > 0 {
+						output := strings.Join(info.Lines, "\n")
+						b.Edit(target, fmt.Sprintf("🚀 **Running:** `%s`\n\n```\n%s\n```", info.CmdStr, output), telebot.ModeMarkdown, selector)
+					}
+					info.mu.Unlock()
+					if cmd.ProcessState != nil {
+						goto end
+					}
+				}
+			}
+		end:
+			cmd.Wait()
+			status := "✅ Hoàn thành"
+			if ctx.Err() != nil { status = "🛑 Đã dừng" }
+			b.Edit(target, fmt.Sprintf("**%s:** `%s`", status, info.CmdStr), telebot.ModeMarkdown)
+		}(msg, pInfo)
+
+		return nil
+	})
+
+	log.Printf("Bot đang chạy...")
+	b.Start()
+}
+EOF
 
 RUN go build -o bot main.go
 
-# Giai đoạn 2: Runtime
+# Giai đoạn 2: Runtime Ubuntu 24.04
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y ca-certificates coreutils curl wget git && apt-get clean
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates coreutils curl wget git htop \
+    iputils-ping dnsutils net-tools \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY --from=builder /app/bot .
+
+# Cấp quyền thực thi và chạy
+RUN chmod +x bot
 CMD ["./bot"]
