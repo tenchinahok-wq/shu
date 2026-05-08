@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,36 +20,62 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+var (
+	ansiRegex     = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	activeProcs   = make(map[int]*ProcInfo)
+	procsMu       sync.Mutex
+	adminID       int64
+	jobSemaphore  = make(chan struct{}, 3) 
+)
 
 type ProcInfo struct {
 	Cmd    *exec.Cmd
-	Logs   string
+	Logs   strings.Builder
 	Mu     sync.Mutex
 	Cancel context.CancelFunc
 }
 
-var (
-	activeProcs = make(map[int]*ProcInfo)
-	procsMu     sync.Mutex
-	adminID     int64
-)
+func isMultiLineCmd(cmd string) bool {
+	cmd = strings.ToLower(strings.Fields(cmd)[0])
+	systemPrefixes := map[string]bool{
+		"ls": true, "apt": true, "npm": true, "python": true,
+		"cat": true, "df": true, "ps": true, "netstat": true, "find": true, "grep": true,
+	}
+	return systemPrefixes[cmd]
+}
 
-func formatLiveLog(raw string) string {
-	if raw == "" {
-		return ""
+func isDangerous(cmd string) bool {
+	cmd = strings.ToLower(cmd)
+	dangerZone := []string{"rm -rf /", "mkfs", ":(){ :|:& };:", "dd if=", "shutdown", "reboot"}
+	for _, d := range dangerZone {
+		if strings.Contains(cmd, d) {
+			return true
+		}
 	}
-	lines := strings.Split(strings.TrimSpace(raw), "\n")
-	if len(lines) == 0 {
-		return ""
-	}
-	
-	lastLine := lines[len(lines)-1]
-	if idx := strings.LastIndex(lastLine, "\r"); idx != -1 {
-		lastLine = lastLine[idx+1:]
+	return false
+}
+
+func formatLiveLog(raw string, multiLine bool) string {
+	if raw == "" { return "" }
+	lines := strings.Split(raw, "\n")
+	var cleaned []string
+
+	for _, line := range lines {
+		if strings.Contains(line, "\r") {
+			parts := strings.Split(line, "\r")
+			line = parts[len(parts)-1]
+		}
+		if t := strings.TrimSpace(line); t != "" {
+			cleaned = append(cleaned, t)
+		}
 	}
 
-	return strings.TrimSpace(lastLine)
+	if len(cleaned) == 0 { return "" }
+	if multiLine {
+		if len(cleaned) > 10 { cleaned = cleaned[len(cleaned)-10:] }
+		return strings.Join(cleaned, "\n")
+	}
+	return cleaned[len(cleaned)-1]
 }
 
 func main() {
@@ -57,11 +84,23 @@ func main() {
 	adminID, _ = strconv.ParseInt(idStr, 10, 64)
 
 	bot, err := tgbotapi.NewBotAPI(token)
-	if err != nil {
-		log.Panic(err)
-	}
+	if err != nil { log.Panic(err) }
 
-	log.Printf("Bot Go is ready...")
+	log.Printf("%s", bot.Self.UserName)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		procsMu.Lock()
+		for _, p := range activeProcs {
+			if p.Cmd != nil && p.Cmd.Process != nil {
+				syscall.Kill(-p.Cmd.Process.Pid, syscall.SIGKILL)
+			}
+			p.Cancel()
+		}
+		os.Exit(0)
+	}()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -69,10 +108,10 @@ func main() {
 
 	for update := range updates {
 		if update.Message != nil && update.Message.From.ID == adminID {
-			if update.Message.Document != nil {
-				go handleDocument(bot, update.Message)
-			} else if update.Message.Text != "" {
+			if update.Message.Text != "" {
 				go handleCommand(bot, update.Message)
+			} else if update.Message.Document != nil {
+				go handleDocument(bot, update.Message)
 			}
 		} else if update.CallbackQuery != nil {
 			go handleCallback(bot, update.CallbackQuery)
@@ -81,19 +120,25 @@ func main() {
 }
 
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	defer func() { recover() }()
+
 	cmdStr := msg.Text
-	sentMsg, err := bot.Send(tgbotapi.MessageConfig{
-		BaseChat: tgbotapi.BaseChat{
-			ChatID:      msg.Chat.ID,
-			ReplyMarkup: stopButton(msg.MessageID + 1),
-		},
-		Text:      fmt.Sprintf("<pre>%s</pre>", html.EscapeString(cmdStr)),
-		ParseMode: "HTML",
-	})
-	if err != nil {
-		log.Printf("Error sending initial msg: %v", err)
+	if isDangerous(cmdStr) {
+		reply(bot, msg.Chat.ID, "Cancel")
 		return
 	}
+
+	select {
+	case jobSemaphore <- struct{}{}:
+		defer func() { <-jobSemaphore }()
+	default:
+		reply(bot, msg.Chat.ID, "Max conns")
+		return
+	}
+
+	isMulti := isMultiLineCmd(cmdStr)
+	sentMsg, err := bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "<i>Starting...</i>"))
+	if err != nil { return }
 
 	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
@@ -105,7 +150,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
-	pInfo := &ProcInfo{Cmd: cmd, Logs: "", Cancel: cancel}
+	pInfo := &ProcInfo{Cmd: cmd, Cancel: cancel}
 	procsMu.Lock()
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
@@ -116,17 +161,17 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		for {
 			n, err := rc.Read(buf)
 			if n > 0 {
-				cleanStr := ansiRegex.ReplaceAllString(string(buf[:n]), "")
+				clean := ansiRegex.ReplaceAllString(string(buf[:n]), "")
 				pInfo.Mu.Lock()
-				pInfo.Logs += cleanStr
-				if len(pInfo.Logs) > 2048 {
-					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-2048:]
+				if pInfo.Logs.Len() > 5000 {
+					oldLogs := pInfo.Logs.String()
+					pInfo.Logs.Reset()
+					pInfo.Logs.WriteString(oldLogs[len(oldLogs)-2000:])
 				}
+				pInfo.Logs.WriteString(clean)
 				pInfo.Mu.Unlock()
 			}
-			if err != nil {
-				break
-			}
+			if err != nil { break }
 		}
 	}
 
@@ -140,69 +185,56 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	
-	stopTicker := make(chan bool)
-	var lastSentContent string
+	var lastSent string
 
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				pInfo.Mu.Lock()
-				currentLog := formatLiveLog(pInfo.Logs)
-				pInfo.Mu.Unlock()
+	updateLoop:
+	for {
+		select {
+		case <-ticker.C:
+			pInfo.Mu.Lock()
+			current := formatLiveLog(pInfo.Logs.String(), isMulti)
+			pInfo.Mu.Unlock()
 
-				if currentLog != "" {
-					escapedCmd := html.EscapeString(cmdStr)
-					escapedLog := html.EscapeString(currentLog)
-					
-					newContent := fmt.Sprintf("<pre>%s\n\n%s</pre>", escapedCmd, escapedLog)
-					
-					if newContent != lastSentContent && len(newContent) < 4000 {
-						edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, newContent)
-						edit.ParseMode = "HTML"
-						markup := stopButton(targetMsgID)
-						edit.ReplyMarkup = &markup
-						
-						bot.Send(edit)
-						lastSentContent = newContent
-					}
+			if current != "" {
+				newMsg := fmt.Sprintf("<pre>%s\n\n%s</pre>", html.EscapeString(cmdStr), html.EscapeString(current))
+				if newMsg != lastSent && len(newMsg) < 4000 {
+					edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, newMsg)
+					edit.ParseMode = "HTML"
+					markup := stopButton(targetMsgID)
+					edit.ReplyMarkup = &markup
+					bot.Send(edit)
+					lastSent = newMsg
 				}
-			case <-stopTicker:
-				return
 			}
+		case <-ctx.Done():
+			break updateLoop
 		}
-	}()
+		
+		if cmd.ProcessState != nil || ctx.Err() != nil { break }
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	_ = cmd.Wait()
-	stopTicker <- true
-
+	cmd.Wait()
 	procsMu.Lock()
 	delete(activeProcs, targetMsgID)
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	finalLog := formatLiveLog(pInfo.Logs)
+	final := formatLiveLog(pInfo.Logs.String(), isMulti)
 	pInfo.Mu.Unlock()
 
-	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>", 
-		html.EscapeString(cmdStr), html.EscapeString(finalLog))
-	
+	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>", html.EscapeString(cmdStr), html.EscapeString(final))
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
 }
 
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
-	resp, err := http.Get(fileURL)
-	if err != nil { return }
+	resp, _ := http.Get(fileURL)
 	defer resp.Body.Close()
-	
-	out, err := os.Create(msg.Document.FileName)
-	if err != nil { return }
+	out, _ := os.Create(msg.Document.FileName)
 	defer out.Close()
-	
 	io.Copy(out, resp.Body)
-	reply(bot, msg.Chat.ID, "Saved: "+msg.Document.FileName)
+	reply(bot, msg.Chat.ID, "Saved: <code>"+msg.Document.FileName+"</code>")
 }
 
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -212,9 +244,9 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		pInfo, ok := activeProcs[msgID]
 		procsMu.Unlock()
 		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
-			_ = syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
+			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
-			_, _ = bot.Request(tgbotapi.NewCallback(query.ID, "Cancel..."))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel"))
 		}
 	}
 }
@@ -226,17 +258,11 @@ func stopButton(msgID int) tgbotapi.InlineKeyboardMarkup {
 }
 
 func reply(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	m := tgbotapi.NewMessage(chatID, text)
-	m.ParseMode = "HTML"
-	bot.Send(m)
+	m := tgbotapi.NewMessage(chatID, text); m.ParseMode = "HTML"; bot.Send(m)
 }
 
 func editMsg(bot *tgbotapi.BotAPI, chatID int64, msgID int, text string, btn bool) {
-	e := tgbotapi.NewEditMessageText(chatID, msgID, text)
-	e.ParseMode = "HTML"
-	if btn {
-		m := stopButton(msgID)
-		e.ReplyMarkup = &m
-	}
-	_, _ = bot.Send(e)
+	e := tgbotapi.NewEditMessageText(chatID, msgID, text); e.ParseMode = "HTML"
+	if btn { m := stopButton(msgID); e.ReplyMarkup = &m }
+	bot.Send(e)
 }
