@@ -63,11 +63,11 @@ func main() {
 
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	cmdStr := msg.Text
-	// Gửi tin nhắn ban đầu (giống Node: ctx.reply)
+	// 1. Gửi tin nhắn gốc (Giống Node: ctx.reply)
 	sentMsg, _ := bot.Send(tgbotapi.MessageConfig{
 		BaseChat: tgbotapi.BaseChat{
 			ChatID:      msg.Chat.ID,
-			ReplyMarkup: stopButton(msg.MessageID + 1),
+			ReplyMarkup: stopButton(msg.MessageID + 1), 
 		},
 		Text:      fmt.Sprintf("<code>%s</code>", html.EscapeString(cmdStr)),
 		ParseMode: "HTML",
@@ -76,9 +76,9 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
 	
-	// QUAN TRỌNG: Dùng stdbuf -oL -eL để ép hệ thống xuất log ngay lập tức (Line Buffering)
+	// Ép log ra ngay lập tức bằng stdbuf
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} 
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -88,7 +88,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
-	// Luồng đọc log (giống child.stdout.on('data'))
+	// 2. Luồng đọc log (Giống child.stdout.on('data'))
 	readLogs := func(r io.Reader, limit int) {
 		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
@@ -108,7 +108,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	// Ticker chạy mỗi 3 giây để cập nhật tin nhắn (giống setInterval trong Node)
+	// 3. Ticker cập nhật tin nhắn mỗi 3 giây (Giống setInterval trong Node)
 	ticker := time.NewTicker(3 * time.Second)
 	stopTicker := make(chan bool)
 
@@ -133,17 +133,17 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 					pInfo.Mu.Unlock()
 				}
 			case <-stopTicker:
-				ticker.Stop()
 				return
 			}
 		}
 	}()
 
-	// Chờ lệnh chạy xong
+	// Đợi lệnh chạy xong
 	err := cmd.Wait()
-	stopTicker <- true // Dừng ticker cập nhật định kỳ
+	ticker.Stop()
+	stopTicker <- true
 
-	// Cleanup cuối cùng (giống hàm cleanup trong Node)
+	// 4. Cleanup cuối cùng (Giống hàm cleanup trong Node)
 	status := " Success"
 	if err != nil {
 		status = " Cancel"
@@ -153,12 +153,18 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	delete(activeProcs, targetMsgID)
 	procsMu.Unlock()
 
-	finalText := fmt.Sprintf("%s: <code>%s</code>\n\n<b>The process is over.</b>", 
-		status, html.EscapeString(cmdStr))
+	// Lấy log cuối cùng để hiển thị
+	pInfo.Mu.Lock()
+	finalLogs := strings.Join(pInfo.Logs, "\n")
+	pInfo.Mu.Unlock()
+
+	finalText := fmt.Sprintf("%s: <code>%s</code>\n\n<pre>%s</pre>\n\n<b>The process is over.</b>", 
+		status, html.EscapeString(cmdStr), html.EscapeString(finalLogs))
+	
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
 }
 
-// --- Các hàm phụ trợ ---
+// --- Các hàm phụ trợ giữ nguyên logic ổn định ---
 
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
@@ -176,10 +182,14 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		procsMu.Lock()
 		pInfo, ok := activeProcs[msgID]
 		procsMu.Unlock()
-		if ok && pInfo.Cmd.Process != nil {
+
+		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
+			// Kill toàn bộ process group (Giống process.kill(-pid))
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
 			bot.Request(tgbotapi.NewCallback(query.ID, "Stopping..."))
+		} else {
+			bot.Request(tgbotapi.NewCallback(query.ID, "Process not found."))
 		}
 	}
 }
