@@ -90,21 +90,22 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	cmdStr := msg.Text
-	// Tạo message gốc với nút Cancel
+	// Gửi tin nhắn khởi tạo
 	sentMsg, _ := bot.Send(tgbotapi.MessageConfig{
 		BaseChat: tgbotapi.BaseChat{
 			ChatID:      msg.Chat.ID,
-			ReplyMarkup: stopButton(msg.MessageID + 1), // Dự đoán ID tiếp theo hoặc dùng ID message này
+			ReplyMarkup: stopButton(msg.MessageID + 1), 
 		},
-		Text:      fmt.Sprintf("<b>Lệnh:</b> <code>%s</code>", html.EscapeString(cmdStr)),
+		Text:      fmt.Sprintf("<b>🚀 Đang chạy:</b> <code>%s</code>", html.EscapeString(cmdStr)),
 		ParseMode: "HTML",
 	})
 
 	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
-	
+	defer cancel()
+
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Tạo process group để kill sạch
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} 
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -114,11 +115,51 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
+	var (
+		lastUpdate = time.Now()
+		updateMu   sync.Mutex
+	)
+
+	// Hàm cập nhật message (có giới hạn tốc độ để tránh spam API)
+	updateUI := func(final bool) {
+		updateMu.Lock()
+		defer updateMu.Unlock()
+
+		// Chỉ cập nhật nếu cách lần cuối 1.2s hoặc là lần cuối cùng
+		if final || time.Since(lastUpdate) > 1200*time.Millisecond {
+			pInfo.Mu.Lock()
+			logContent := strings.Join(pInfo.Logs, "\n")
+			pInfo.Mu.Unlock()
+
+			if logContent == "" && !final {
+				return
+			}
+
+			statusHeader := "🚀 Đang chạy"
+			if final {
+				statusHeader = "✅ Kết thúc"
+			}
+
+			text := fmt.Sprintf("<b>%s:</b> <code>%s</code>\n\n<pre>%s</pre>", 
+				statusHeader, html.EscapeString(cmdStr), html.EscapeString(logContent))
+			
+			if final {
+				text += "\n<b>The process is over.</b>"
+			}
+
+			edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, text)
+			edit.ParseMode = "HTML"
+			if !final {
+				markup := stopButton(targetMsgID)
+				edit.ReplyMarkup = &markup
+			}
+			bot.Send(edit)
+			lastUpdate = time.Now()
+		}
+	}
+
 	// Đọc log
-	var wg sync.WaitGroup
-	wg.Add(2)
-	readLogs := func(r io.Reader, limit int) {
-		defer wg.Done()
+	readFunc := func(r io.Reader, limit int) {
 		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
 			pInfo.Mu.Lock()
@@ -127,57 +168,21 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				pInfo.Logs = pInfo.Logs[1:]
 			}
 			pInfo.Mu.Unlock()
+			updateUI(false)
 		}
 	}
-	go readLogs(stdout, 15)
-	go readLogs(stderr, 5)
 
-	cmd.Start()
+	go readFunc(stdout, 15)
+	go readFunc(stderr, 5)
 
-	// Ticker update message mỗi 3s
-	ticker := time.NewTicker(3 * time.Second)
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				pInfo.Mu.Lock()
-				if len(pInfo.Logs) > 0 {
-					output := strings.Join(pInfo.Logs, "\n")
-					editMsg(bot, msg.Chat.ID, targetMsgID, 
-						fmt.Sprintf("<b>Lệnh:</b> <code>%s</code>\n\n<pre>%s</pre>", 
-						html.EscapeString(cmdStr), html.EscapeString(output)), 
-						true)
-				}
-				pInfo.Mu.Unlock()
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	err := cmd.Wait()
-	ticker.Stop()
-	done <- true
-
-	status := "✅ Success"
+	err := cmd.Start()
 	if err != nil {
-		status = "❌ Cancel/Error"
+		editMsg(bot, msg.Chat.ID, targetMsgID, "❌ Lỗi: "+err.Error(), false)
+		return
 	}
 
-	// Cập nhật lần cuối: Giữ nguyên lệnh ở đầu, thêm thông báo kết thúc
-	finalLog := ""
-	pInfo.Mu.Lock()
-	if len(pInfo.Logs) > 0 {
-		finalLog = "\n\n<pre>" + html.EscapeString(strings.Join(pInfo.Logs, "\n")) + "</pre>"
-	}
-	pInfo.Mu.Unlock()
-
-	editMsg(bot, msg.Chat.ID, targetMsgID, 
-		fmt.Sprintf("%s: <code>%s</code>%s\n\n<b>The process is over.</b>", 
-		status, html.EscapeString(cmdStr), finalLog), 
-		false)
+	cmd.Wait()
+	updateUI(true) // Cập nhật lần cuối cùng
 
 	procsMu.Lock()
 	delete(activeProcs, targetMsgID)
@@ -192,12 +197,11 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		procsMu.Unlock()
 
 		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
-			// Kill toàn bộ process group
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
-			bot.Request(tgbotapi.NewCallback(query.ID, "Đang dừng lệnh..."))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Đang dừng..."))
 		} else {
-			bot.Request(tgbotapi.NewCallback(query.ID, "Lệnh không còn tồn tại."))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Tiến trình đã kết thúc."))
 		}
 	}
 }
