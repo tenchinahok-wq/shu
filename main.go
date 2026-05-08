@@ -40,6 +40,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Middleware Admin
 	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
@@ -49,7 +50,7 @@ func main() {
 		}
 	})
 
-	// 1. LƯU FILE
+	// 1. XỬ LÝ LƯU FILE
 	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
 		doc := c.Message().Document
 		fileReader, err := b.File(&doc.File)
@@ -63,7 +64,7 @@ func main() {
 		return c.Send(fmt.Sprintf("📥 Đã lưu file: `%s`", doc.FileName), telebot.ModeMarkdown)
 	})
 
-	// 2. NÚT DỪNG
+	// 2. XỬ LÝ NÚT DỪNG
 	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
 		data := c.Callback().Data
 		if strings.HasPrefix(data, "stop_") {
@@ -73,23 +74,30 @@ func main() {
 			procsMu.Unlock()
 			if exists && info.Cmd != nil && info.Cmd.Process != nil {
 				_ = syscall.Kill(-info.Cmd.Process.Pid, syscall.SIGKILL)
-				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Đang dừng..."})
-			} else {
-				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Hết hạn hoặc đã xong."})
+				return b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Đang dừng..."})
 			}
+			return b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Hết hạn hoặc đã xong."})
 		}
 		return nil
 	})
 
-	// 3. CHẠY LỆNH
+	// 3. XỬ LÝ CHẠY LỆNH
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		cmdStr := c.Text()
-		msg, _ := b.Send(fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown)
 		
+		// Gửi tin nhắn khởi tạo
+		msg, err := b.Send(c.Recipient(), fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown)
+		if err != nil {
+			return err
+		}
+
+		// Tạo nút dừng
 		menu := &telebot.ReplyMarkup{}
 		btnStop := menu.Data("⛔ DỪNG LỆNH", "stop_"+strconv.Itoa(msg.ID))
 		menu.Inline(menu.Row(btnStop))
-		b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown, menu)
+		
+		// Cập nhật tin nhắn để có nút bấm
+		msg, _ = b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown, menu)
 
 		cmd := exec.Command("sh", "-c", "stdbuf -oL -eL "+cmdStr)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -116,7 +124,8 @@ func main() {
 		go readFn(stderr)
 
 		if err := cmd.Start(); err != nil {
-			return b.Edit(msg, "❌ Lỗi: "+err.Error())
+			_, errEdit := b.Edit(msg, "❌ Lỗi: "+err.Error())
+			return errEdit
 		}
 
 		done := make(chan bool)
@@ -131,20 +140,20 @@ func main() {
 					info.Mu.Lock()
 					if len(info.Logs) > 0 {
 						out := strings.Join(info.Logs, "\n")
-						// Dùng dấu huyền để tránh lỗi newline in string
-						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n```", cmdStr, out)
-						b.Edit(msg, txt, telebot.ModeMarkdown, menu)
+						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n
+```", cmdStr, out)
+						_, _ = b.Edit(msg, txt, telebot.ModeMarkdown, menu)
 					}
 					info.Mu.Unlock()
 				}
 			}
 		}()
 
-		err := cmd.Wait()
+		waitErr := cmd.Wait()
 		done <- true
 
 		status := "✅ Hoàn thành"
-		if err != nil {
+		if waitErr != nil {
 			status = "🛑 Đã dừng"
 		}
 
@@ -152,8 +161,8 @@ func main() {
 		delete(activeProcs, msg.ID)
 		procsMu.Unlock()
 
-		b.Edit(msg, fmt.Sprintf("%s: `%s` \n\n`Tiến trình kết thúc.`", status, cmdStr), telebot.ModeMarkdown)
-		return nil
+		_, errFinal := b.Edit(msg, fmt.Sprintf("%s: `%s` \n\n`Tiến trình kết thúc.`", status, cmdStr), telebot.ModeMarkdown)
+		return errFinal
 	})
 
 	log.Println("Bot Go đang chạy...")
