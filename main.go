@@ -40,7 +40,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Middleware Admin
 	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
@@ -58,13 +57,8 @@ func main() {
 			return c.Reply("❌ Lỗi lấy file: " + err.Error())
 		}
 		defer fileReader.Close()
-
-		out, err := os.Create(doc.FileName)
-		if err != nil {
-			return c.Reply("❌ Lỗi tạo file: " + err.Error())
-		}
+		out, _ := os.Create(doc.FileName)
 		defer out.Close()
-
 		io.Copy(out, fileReader)
 		return c.Send(fmt.Sprintf("📥 Đã lưu file: `%s`", doc.FileName), telebot.ModeMarkdown)
 	})
@@ -77,13 +71,11 @@ func main() {
 			procsMu.Lock()
 			info, exists := activeProcs[msgID]
 			procsMu.Unlock()
-
 			if exists && info.Cmd != nil && info.Cmd.Process != nil {
-				// Kill cả process group
 				_ = syscall.Kill(-info.Cmd.Process.Pid, syscall.SIGKILL)
 				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Đang dừng..."})
 			} else {
-				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Lệnh không còn tồn tại."})
+				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Hết hạn hoặc đã xong."})
 			}
 		}
 		return nil
@@ -92,18 +84,15 @@ func main() {
 	// 3. CHẠY LỆNH
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		cmdStr := c.Text()
-		menu := &telebot.ReplyMarkup{}
-		// Bước 1: Gửi tin nhắn khởi tạo
 		msg, _ := b.Send(fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown)
 		
-		// Bước 2: Tạo nút dừng với ID thật của tin nhắn vừa gửi
+		menu := &telebot.ReplyMarkup{}
 		btnStop := menu.Data("⛔ DỪNG LỆNH", "stop_"+strconv.Itoa(msg.ID))
 		menu.Inline(menu.Row(btnStop))
 		b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown, menu)
 
 		cmd := exec.Command("sh", "-c", "stdbuf -oL -eL "+cmdStr)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 
@@ -112,7 +101,6 @@ func main() {
 		activeProcs[msg.ID] = info
 		procsMu.Unlock()
 
-		// Luồng đọc log
 		readFn := func(r io.Reader) {
 			scanner := bufio.NewScanner(r)
 			for scanner.Scan() {
@@ -131,7 +119,6 @@ func main() {
 			return b.Edit(msg, "❌ Lỗi: "+err.Error())
 		}
 
-		// Luồng cập nhật UI (Ticker)
 		done := make(chan bool)
 		go func() {
 			ticker := time.NewTicker(1500 * time.Millisecond)
@@ -143,9 +130,9 @@ func main() {
 				case <-ticker.C:
 					info.Mu.Lock()
 					if len(info.Logs) > 0 {
-						output := strings.Join(info.Logs, "\n")
-						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n
-```", cmdStr, output)
+						out := strings.Join(info.Logs, "\n")
+						// Dùng dấu huyền để tránh lỗi newline in string
+						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n```", cmdStr, out)
 						b.Edit(msg, txt, telebot.ModeMarkdown, menu)
 					}
 					info.Mu.Unlock()
