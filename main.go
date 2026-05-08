@@ -34,6 +34,28 @@ var (
 	adminID     int64
 )
 
+func formatLiveLog(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	lines := strings.Split(raw, "\n")
+	var lastLine string
+
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			lastLine = lines[i]
+			break
+		}
+	}
+
+	if strings.Contains(lastLine, "\r") {
+		parts := strings.Split(lastLine, "\r")
+		lastLine = parts[len(parts)-1]
+	}
+
+	return strings.TrimSpace(lastLine)
+}
+
 func main() {
 	token := os.Getenv("TK")
 	idStr := os.Getenv("ID")
@@ -97,8 +119,8 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				cleanStr := ansiRegex.ReplaceAllString(string(buf[:n]), "")
 				pInfo.Mu.Lock()
 				pInfo.Logs += cleanStr
-				if len(pInfo.Logs) > 2048 {
-					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-2048:]
+				if len(pInfo.Logs) > 4096 {
+					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-4096:]
 				}
 				pInfo.Mu.Unlock()
 			}
@@ -126,14 +148,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			select {
 			case <-ticker.C:
 				pInfo.Mu.Lock()
-				trimmed := strings.TrimSpace(pInfo.Logs)
+				currentLog := formatLiveLog(pInfo.Logs)
 				pInfo.Mu.Unlock()
 
-				if trimmed != "" {
-					lines := strings.Split(trimmed, "\n")
-					currentLog := lines[len(lines)-1]
-
-					content := fmt.Sprintf("<pre>%s\n%s</pre>", 
+				if currentLog != "" {
+					content := fmt.Sprintf("<pre>%s\n\n%s</pre>", 
 						html.EscapeString(cmdStr), html.EscapeString(currentLog))
 					
 					edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, content)
@@ -156,17 +175,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	finalTrimmed := strings.TrimSpace(pInfo.Logs)
+	finalLog := formatLiveLog(pInfo.Logs)
 	pInfo.Mu.Unlock()
 
-	finalLogs := ""
-	if finalTrimmed != "" {
-		fLines := strings.Split(finalTrimmed, "\n")
-		finalLogs = fLines[len(fLines)-1]
-	}
-
-	finalText := fmt.Sprintf("<pre>%s\n%s</pre>", 
-		html.EscapeString(cmdStr), html.EscapeString(finalLogs))
+	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>", 
+		html.EscapeString(cmdStr), html.EscapeString(finalLog))
 	
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
 }
