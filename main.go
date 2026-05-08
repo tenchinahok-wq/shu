@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp" // Thêm thư viện này
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,9 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// Regex để bắt các mã ANSI escape (màu sắc, xóa dòng [K, v.v.)
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 type ProcInfo struct {
 	Cmd    *exec.Cmd
@@ -62,7 +66,6 @@ func main() {
 
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	cmdStr := msg.Text
-	// Gửi tin nhắn gốc
 	sentMsg, _ := bot.Send(tgbotapi.MessageConfig{
 		BaseChat: tgbotapi.BaseChat{
 			ChatID:      msg.Chat.ID,
@@ -75,7 +78,6 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
 	
-	// Dùng stdbuf để ép output ra liên tục
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -87,15 +89,20 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
-	// Hàm đọc log trực tiếp (Giống Node.js on('data'))
+	// --- HÀM ĐỌC VÀ LỌC LOG ---
 	readToLogs := func(r io.Reader) {
-		buf := make([]byte, 1024)
+		buf := make([]byte, 2048)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
+				// Lấy chuỗi thô
+				rawStr := string(buf[:n])
+				// LỌC SẠCH MÃ MÀU VÀ KÝ TỰ ĐIỀU KHIỂN
+				cleanStr := ansiRegex.ReplaceAllString(rawStr, "")
+				
 				pInfo.Mu.Lock()
-				pInfo.Logs += string(buf[:n])
-				// Giữ khoảng 1000 ký tự cuối để không quá tải Telegram
+				pInfo.Logs += cleanStr
+				// Giữ 1000 ký tự cuối để Telegram không bị crash
 				if len(pInfo.Logs) > 1000 {
 					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-1000:]
 				}
@@ -115,7 +122,6 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	// Ticker update message mỗi 3 giây (Y hệt setInterval của Node)
 	ticker := time.NewTicker(3 * time.Second)
 	stopTicker := make(chan bool)
 
@@ -145,9 +151,8 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}()
 
 	err := cmd.Wait()
-	stopTicker <- true // Dừng cập nhật định kỳ
+	stopTicker <- true
 
-	// Update lần cuối và kết thúc
 	status := " Success"
 	if err != nil {
 		status = " Cancel"
@@ -167,8 +172,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
 }
 
-// --- Các hàm hỗ trợ ---
-
+// --- Các hàm hỗ trợ giữ nguyên ---
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
 	resp, _ := http.Get(fileURL)
