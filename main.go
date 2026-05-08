@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"html"
@@ -9,7 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp" // Thêm thư viện này
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,12 +20,11 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// Regex để bắt các mã ANSI escape (màu sắc, xóa dòng [K, v.v.)
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 type ProcInfo struct {
 	Cmd    *exec.Cmd
-	Logs   string
+	Logs   []string
 	Mu     sync.Mutex
 	Cancel context.CancelFunc
 }
@@ -45,7 +45,7 @@ func main() {
 		log.Panic(err)
 	}
 
-	log.Printf("Bot Go đã sẵn sàng...")
+	log.Printf("Bot Go is ready...")
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -71,12 +71,13 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			ChatID:      msg.Chat.ID,
 			ReplyMarkup: stopButton(msg.MessageID + 1),
 		},
-		Text:      fmt.Sprintf("<code>%s</code>", html.EscapeString(cmdStr)),
+		Text:      fmt.Sprintf("<pre>%s</pre>", html.EscapeString(cmdStr)),
 		ParseMode: "HTML",
 	})
 
-	targetMsgID := sentMsg.MessageID
+	targetMsgID := sentMsg.Message_ID
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -84,45 +85,36 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
-	pInfo := &ProcInfo{Cmd: cmd, Logs: "", Cancel: cancel}
+	pInfo := &ProcInfo{Cmd: cmd, Logs: []string{}, Cancel: cancel}
 	procsMu.Lock()
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
-	// --- HÀM ĐỌC VÀ LỌC LOG ---
-	readToLogs := func(r io.Reader) {
-		buf := make([]byte, 2048)
-		for {
-			n, err := r.Read(buf)
-			if n > 0 {
-				// Lấy chuỗi thô
-				rawStr := string(buf[:n])
-				// LỌC SẠCH MÃ MÀU VÀ KÝ TỰ ĐIỀU KHIỂN
-				cleanStr := ansiRegex.ReplaceAllString(rawStr, "")
-				
-				pInfo.Mu.Lock()
-				pInfo.Logs += cleanStr
-				// Giữ 1000 ký tự cuối để Telegram không bị crash
-				if len(pInfo.Logs) > 1000 {
-					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-1000:]
-				}
-				pInfo.Mu.Unlock()
+	readToLogs := func(r io.Reader, limit int) {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := ansiRegex.ReplaceAllString(scanner.Text(), "")
+			
+			pInfo.Mu.Lock()
+			pInfo.Logs = append(pInfo.Logs, line)
+			if len(pInfo.Logs) > limit {
+				pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-limit:]
 			}
-			if err != nil {
-				break
-			}
+			pInfo.Mu.Unlock()
 		}
 	}
 
-	go readToLogs(stdout)
-	go readToLogs(stderr)
+	go readToLogs(stdout, 1)
+	go readToLogs(stderr, 10)
 
 	if err := cmd.Start(); err != nil {
 		editMsg(bot, msg.Chat.ID, targetMsgID, "Error: "+err.Error(), false)
 		return
 	}
 
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) 
+	defer ticker.Stop()
+	
 	stopTicker := make(chan bool)
 
 	go func() {
@@ -130,11 +122,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			select {
 			case <-ticker.C:
 				pInfo.Mu.Lock()
-				currentLog := pInfo.Logs
+				currentLog := strings.Join(pInfo.Logs, "\n")
 				pInfo.Mu.Unlock()
 
 				if currentLog != "" {
-					content := fmt.Sprintf("<code>%s</code>\n\n<pre>%s</pre>", 
+					content := fmt.Sprintf("<pre>%s\n%s</pre>", 
 						html.EscapeString(cmdStr), html.EscapeString(currentLog))
 					
 					edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, content)
@@ -144,7 +136,6 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 					bot.Send(edit)
 				}
 			case <-stopTicker:
-				ticker.Stop()
 				return
 			}
 		}
@@ -153,26 +144,20 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	err := cmd.Wait()
 	stopTicker <- true
 
-	status := " Success"
-	if err != nil {
-		status = " Cancel"
-	}
-
 	procsMu.Lock()
 	delete(activeProcs, targetMsgID)
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	finalLogs := pInfo.Logs
+	finalLogs := strings.Join(pInfo.Logs, "\n")
 	pInfo.Mu.Unlock()
 
-	finalText := fmt.Sprintf("%s: <code>%s</code>\n\n<pre>%s</pre>\n\n<b>The process is over.</b>", 
-		status, html.EscapeString(cmdStr), html.EscapeString(finalLogs))
+	finalText := fmt.Sprintf("<pre>%s\n%s</pre>", 
+		html.EscapeString(cmdStr), html.EscapeString(finalLogs))
 	
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
 }
 
-// --- Các hàm hỗ trợ giữ nguyên ---
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
 	resp, _ := http.Get(fileURL)
@@ -180,7 +165,7 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	out, _ := os.Create(msg.Document.FileName)
 	defer out.Close()
 	io.Copy(out, resp.Body)
-	reply(bot, msg.Chat.ID, "Saved file: "+msg.Document.FileName)
+	reply(bot, msg.Chat.ID, "Saved: "+msg.Document.FileName)
 }
 
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -192,7 +177,7 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		if ok && pInfo.Cmd.Process != nil {
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
-			bot.Request(tgbotapi.NewCallback(query.ID, "Stopping..."))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel..."))
 		}
 	}
 }
