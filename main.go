@@ -218,7 +218,7 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	defer out.Close()
 	
 	io.Copy(out, resp.Body)
-	reply(bot, msg.Chat.ID, "<pre>"+msg.Document.FileName"</pre>")
+	reply(bot, msg.Chat.ID, "<pre>"+msg.Document.FileName+"</pre>")
 }
 
 func stopButton(msgID int) tgbotapi.InlineKeyboardMarkup {
