@@ -76,7 +76,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer cancel() 
 	
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -126,14 +126,13 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			select {
 			case <-ticker.C:
 				pInfo.Mu.Lock()
-				lines := strings.Split(pInfo.Logs, "\n")
-				if len(lines) > 1 {
-					lines = lines[len(lines)-1:]
-				}
-				currentLog := strings.Join(lines, "\n")
+				trimmed := strings.TrimSpace(pInfo.Logs)
 				pInfo.Mu.Unlock()
 
-				if currentLog != "" {
+				if trimmed != "" {
+					lines := strings.Split(trimmed, "\n")
+					currentLog := lines[len(lines)-1]
+
 					content := fmt.Sprintf("<pre>%s\n%s</pre>", 
 						html.EscapeString(cmdStr), html.EscapeString(currentLog))
 					
@@ -149,7 +148,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 	}()
 
-	err := cmd.Wait()
+	_ = cmd.Wait() 
 	stopTicker <- true
 
 	procsMu.Lock()
@@ -157,12 +156,14 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	lines := strings.Split(pInfo.Logs, "\n")
-	if len(lines) > 1 {
-		lines = lines[len(lines)-1:]
-	}
-	finalLogs := strings.Join(lines, "\n")
+	finalTrimmed := strings.TrimSpace(pInfo.Logs)
 	pInfo.Mu.Unlock()
+
+	finalLogs := ""
+	if finalTrimmed != "" {
+		fLines := strings.Split(finalTrimmed, "\n")
+		finalLogs = fLines[len(fLines)-1]
+	}
 
 	finalText := fmt.Sprintf("<pre>%s\n%s</pre>", 
 		html.EscapeString(cmdStr), html.EscapeString(finalLogs))
@@ -172,10 +173,14 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
-	resp, _ := http.Get(fileURL)
+	resp, err := http.Get(fileURL)
+	if err != nil { return }
 	defer resp.Body.Close()
-	out, _ := os.Create(msg.Document.FileName)
+	
+	out, err := os.Create(msg.Document.FileName)
+	if err != nil { return }
 	defer out.Close()
+	
 	io.Copy(out, resp.Body)
 	reply(bot, msg.Chat.ID, "Saved: "+msg.Document.FileName)
 }
@@ -186,7 +191,7 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		procsMu.Lock()
 		pInfo, ok := activeProcs[msgID]
 		procsMu.Unlock()
-		if ok && pInfo.Cmd.Process != nil {
+		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
 			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel..."))
