@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"html"
@@ -24,7 +23,7 @@ var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 type ProcInfo struct {
 	Cmd    *exec.Cmd
-	Logs   []string
+	Logs   string
 	Mu     sync.Mutex
 	Cancel context.CancelFunc
 }
@@ -75,7 +74,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		ParseMode: "HTML",
 	})
 
-	targetMsgID := sentMsg.Message_ID
+	targetMsgID := sentMsg.MessageID
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	
@@ -85,27 +84,32 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
-	pInfo := &ProcInfo{Cmd: cmd, Logs: []string{}, Cancel: cancel}
+	pInfo := &ProcInfo{Cmd: cmd, Logs: "", Cancel: cancel}
 	procsMu.Lock()
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
-	readToLogs := func(r io.Reader, limit int) {
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			line := ansiRegex.ReplaceAllString(scanner.Text(), "")
-			
-			pInfo.Mu.Lock()
-			pInfo.Logs = append(pInfo.Logs, line)
-			if len(pInfo.Logs) > limit {
-				pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-limit:]
+	readToLogs := func(r io.Reader) {
+		buf := make([]byte, 1024)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				cleanStr := ansiRegex.ReplaceAllString(string(buf[:n]), "")
+				pInfo.Mu.Lock()
+				pInfo.Logs += cleanStr
+				if len(pInfo.Logs) > 2048 {
+					pInfo.Logs = pInfo.Logs[len(pInfo.Logs)-2048:]
+				}
+				pInfo.Mu.Unlock()
 			}
-			pInfo.Mu.Unlock()
+			if err != nil {
+				break
+			}
 		}
 	}
 
-	go readToLogs(stdout, 1)
-	go readToLogs(stderr, 10)
+	go readToLogs(stdout)
+	go readToLogs(stderr)
 
 	if err := cmd.Start(); err != nil {
 		editMsg(bot, msg.Chat.ID, targetMsgID, "Error: "+err.Error(), false)
@@ -122,7 +126,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			select {
 			case <-ticker.C:
 				pInfo.Mu.Lock()
-				currentLog := strings.Join(pInfo.Logs, "\n")
+				lines := strings.Split(pInfo.Logs, "\n")
+				if len(lines) > 1 {
+					lines = lines[len(lines)-1:]
+				}
+				currentLog := strings.Join(lines, "\n")
 				pInfo.Mu.Unlock()
 
 				if currentLog != "" {
@@ -149,7 +157,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	finalLogs := strings.Join(pInfo.Logs, "\n")
+	lines := strings.Split(pInfo.Logs, "\n")
+	if len(lines) > 1 {
+		lines = lines[len(lines)-1:]
+	}
+	finalLogs := strings.Join(lines, "\n")
 	pInfo.Mu.Unlock()
 
 	finalText := fmt.Sprintf("<pre>%s\n%s</pre>", 
