@@ -40,7 +40,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Middleware Admin
 	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
@@ -50,54 +49,48 @@ func main() {
 		}
 	})
 
-	// 1. XỬ LÝ LƯU FILE
 	b.Handle(telebot.OnDocument, func(c telebot.Context) error {
 		doc := c.Message().Document
-		fileReader, err := b.File(&doc.File)
+		f, err := b.File(&doc.File)
 		if err != nil {
-			return c.Reply("❌ Lỗi lấy file: " + err.Error())
+			return c.Reply("Error: " + err.Error())
 		}
-		defer fileReader.Close()
+		defer f.Close()
 		out, _ := os.Create(doc.FileName)
 		defer out.Close()
-		io.Copy(out, fileReader)
-		return c.Send(fmt.Sprintf("📥 Đã lưu file: `%s`", doc.FileName), telebot.ModeMarkdown)
+		io.Copy(out, f)
+		msg := fmt.Sprintf("📥 Saved: `%s`", doc.FileName)
+		return c.Send(msg, telebot.ModeMarkdown)
 	})
 
-	// 2. XỬ LÝ NÚT DỪNG
 	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
 		data := c.Callback().Data
 		if strings.HasPrefix(data, "stop_") {
-			msgID, _ := strconv.Atoi(strings.TrimPrefix(data, "stop_"))
+			idStr := strings.TrimPrefix(data, "stop_")
+			msgID, _ := strconv.Atoi(idStr)
 			procsMu.Lock()
 			info, exists := activeProcs[msgID]
 			procsMu.Unlock()
 			if exists && info.Cmd != nil && info.Cmd.Process != nil {
 				_ = syscall.Kill(-info.Cmd.Process.Pid, syscall.SIGKILL)
-				return b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Đang dừng..."})
+				b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Stopping..."})
 			}
-			return b.Respond(c.Callback(), &telebot.CallbackResponse{Text: "Hết hạn hoặc đã xong."})
 		}
 		return nil
 	})
 
-	// 3. XỬ LÝ CHẠY LỆNH
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		cmdStr := c.Text()
-		
-		// Gửi tin nhắn khởi tạo
-		msg, err := b.Send(c.Recipient(), fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown)
+		header := fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr)
+		msg, err := b.Send(c.Recipient(), header, telebot.ModeMarkdown)
 		if err != nil {
 			return err
 		}
 
-		// Tạo nút dừng
 		menu := &telebot.ReplyMarkup{}
-		btnStop := menu.Data("⛔ DỪNG LỆNH", "stop_"+strconv.Itoa(msg.ID))
-		menu.Inline(menu.Row(btnStop))
-		
-		// Cập nhật tin nhắn để có nút bấm
-		msg, _ = b.Edit(msg, fmt.Sprintf("🚀 **Exec:** `%s`", cmdStr), telebot.ModeMarkdown, menu)
+		btn := menu.Data("⛔ DỪNG LỆNH", "stop_"+strconv.Itoa(msg.ID))
+		menu.Inline(menu.Row(btn))
+		b.Edit(msg, header, telebot.ModeMarkdown, menu)
 
 		cmd := exec.Command("sh", "-c", "stdbuf -oL -eL "+cmdStr)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -109,40 +102,39 @@ func main() {
 		activeProcs[msg.ID] = info
 		procsMu.Unlock()
 
-		readFn := func(r io.Reader) {
-			scanner := bufio.NewScanner(r)
-			for scanner.Scan() {
+		reader := func(r io.Reader) {
+			s := bufio.NewScanner(r)
+			for s.Scan() {
 				info.Mu.Lock()
-				info.Logs = append(info.Logs, scanner.Text())
+				info.Logs = append(info.Logs, s.Text())
 				if len(info.Logs) > 12 {
 					info.Logs = info.Logs[1:]
 				}
 				info.Mu.Unlock()
 			}
 		}
-		go readFn(stdout)
-		go readFn(stderr)
+		go reader(stdout)
+		go reader(stderr)
 
 		if err := cmd.Start(); err != nil {
-			_, errEdit := b.Edit(msg, "❌ Lỗi: "+err.Error())
-			return errEdit
+			b.Edit(msg, "❌ Error: "+err.Error())
+			return nil
 		}
 
 		done := make(chan bool)
 		go func() {
-			ticker := time.NewTicker(1500 * time.Millisecond)
-			defer ticker.Stop()
+			t := time.NewTicker(1500 * time.Millisecond)
+			defer t.Stop()
 			for {
 				select {
 				case <-done:
 					return
-				case <-ticker.C:
+				case <-t.C:
 					info.Mu.Lock()
 					if len(info.Logs) > 0 {
-						out := strings.Join(info.Logs, "\n")
-						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n
-```", cmdStr, out)
-						_, _ = b.Edit(msg, txt, telebot.ModeMarkdown, menu)
+						logs := strings.Join(info.Logs, "\n")
+						txt := fmt.Sprintf("🚀 **Running:** `%s` \n\n```text\n%s\n```", cmdStr, logs)
+						b.Edit(msg, txt, telebot.ModeMarkdown, menu)
 					}
 					info.Mu.Unlock()
 				}
@@ -161,10 +153,11 @@ func main() {
 		delete(activeProcs, msg.ID)
 		procsMu.Unlock()
 
-		_, errFinal := b.Edit(msg, fmt.Sprintf("%s: `%s` \n\n`Tiến trình kết thúc.`", status, cmdStr), telebot.ModeMarkdown)
-		return errFinal
+		finalTxt := fmt.Sprintf("%s: `%s` \n\n`Tiến trình kết thúc.`", status, cmdStr)
+		b.Edit(msg, finalTxt, telebot.ModeMarkdown)
+		return nil
 	})
 
-	log.Println("Bot Go đang chạy...")
+	log.Println("Bot Go is running...")
 	b.Start()
 }
