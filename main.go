@@ -88,19 +88,14 @@ func main() {
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	cmdStr := msg.Text
 
-	sentMsg, _ := bot.Send(tgbotapi.MessageConfig{
-		BaseChat: tgbotapi.BaseChat{
-			ChatID: msg.Chat.ID,
-		},
-		Text:      fmt.Sprintf("<pre>%s</pre>", html.EscapeString(cmdStr)),
-		ParseMode: "HTML",
-	})
-
+	sentMsg, _ := bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("<pre>%s</pre>", html.EscapeString(cmdStr))))
 	targetMsgID := sentMsg.MessageID
-	ctx, cancel := context.WithCancel(context.Background())
 
-	updateMarkup := tgbotapi.NewEditMessageReplyMarkup(msg.Chat.ID, targetMsgID, stopButton(targetMsgID))
-	bot.Send(updateMarkup)
+	editMarkup := tgbotapi.NewEditMessageReplyMarkup(msg.Chat.ID, targetMsgID, stopButton(targetMsgID))
+	bot.Send(editMarkup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -121,7 +116,6 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				cleanStr := ansiRegex.ReplaceAllString(string(buf[:n]), "")
 				pInfo.Mu.Lock()
 				pInfo.Logs.WriteString(cleanStr)
-				
 				if pInfo.Logs.Len() > 4096 {
 					current := pInfo.Logs.String()
 					pInfo.Logs.Reset()
@@ -140,11 +134,12 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	if err := cmd.Start(); err != nil {
 		editMsg(bot, msg.Chat.ID, targetMsgID, "Error: "+err.Error(), false)
-		cancel()
 		return
 	}
 
 	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
 	stopTicker := make(chan bool)
 
 	go func() {
@@ -152,14 +147,14 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			select {
 			case <-ticker.C:
 				pInfo.Mu.Lock()
-				logStr := pInfo.Logs.String()
-				currentLog := formatLiveLog(logStr)
+				logData := pInfo.Logs.String()
+				currentLog := formatLiveLog(logData)
 				pInfo.Mu.Unlock()
 
 				if currentLog != "" {
-					content := fmt.Sprintf("<pre>%s\n\n%s</pre>", 
+					content := fmt.Sprintf("<pre>%s\n\n%s</pre>",
 						html.EscapeString(cmdStr), html.EscapeString(currentLog))
-					
+
 					edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, content)
 					edit.ParseMode = "HTML"
 					markup := stopButton(targetMsgID)
@@ -167,15 +162,13 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 					bot.Send(edit)
 				}
 			case <-stopTicker:
-				ticker.Stop()
 				return
 			}
 		}
 	}()
 
-	_ = cmd.Wait() 
+	_ = cmd.Wait()
 	stopTicker <- true
-	cancel()
 
 	procsMu.Lock()
 	delete(activeProcs, targetMsgID)
@@ -185,10 +178,28 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	finalLog := formatLiveLog(pInfo.Logs.String())
 	pInfo.Mu.Unlock()
 
-	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>", 
+	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>",
 		html.EscapeString(cmdStr), html.EscapeString(finalLog))
-	
+
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
+}
+
+func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(msg.Document.FileName)
+	if err != nil {
+		return
+	}
+	defer out.Close()
+
+	io.Copy(out, resp.Body)
+	reply(bot, msg.Chat.ID, msg.Document.FileName)
 }
 
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -200,25 +211,11 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
-			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel"))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel..."))
 		} else {
-			bot.Request(tgbotapi.NewCallback(query.ID, "Error"))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel"))
 		}
 	}
-}
-
-func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
-	resp, err := http.Get(fileURL)
-	if err != nil { return }
-	defer resp.Body.Close()
-	
-	out, err := os.Create(msg.Document.FileName)
-	if err != nil { return }
-	defer out.Close()
-	
-	io.Copy(out, resp.Body)
-	reply(bot, msg.Chat.ID, "<pre>"+msg.Document.FileName+"</pre>")
 }
 
 func stopButton(msgID int) tgbotapi.InlineKeyboardMarkup {
