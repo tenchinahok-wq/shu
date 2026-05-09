@@ -36,7 +36,7 @@ var (
 
 func formatLiveLog(raw string) string {
 	if raw == "" {
-		return ""
+		return "Executing..."
 	}
 	lines := strings.Split(raw, "\n")
 	var lastLine string
@@ -66,7 +66,7 @@ func main() {
 		log.Panic(err)
 	}
 
-	log.Printf("Bot Go is ready...")
+	log.Printf("Bot Go is ready and listening for commands starting with '.'")
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -76,7 +76,7 @@ func main() {
 		if update.Message != nil && update.Message.From.ID == adminID {
 			if update.Message.Document != nil {
 				go handleDocument(bot, update.Message)
-			} else if update.Message.Text != "" {
+			} else if strings.HasPrefix(update.Message.Text, ".") { // Chỉ nhận lệnh bắt đầu bằng dấu chấm
 				go handleCommand(bot, update.Message)
 			}
 		} else if update.CallbackQuery != nil {
@@ -86,9 +86,10 @@ func main() {
 }
 
 func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	cmdStr := msg.Text
+	// Loại bỏ dấu chấm ở đầu để thực thi lệnh
+	cmdStr := strings.TrimPrefix(msg.Text, ".")
 
-	sentMsg, _ := bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("<pre>%s</pre>", html.EscapeString(cmdStr))))
+	sentMsg, _ := bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("<b>Running:</b> <code>%s</code>", html.EscapeString(cmdStr))))
 	targetMsgID := sentMsg.MessageID
 
 	editMarkup := tgbotapi.NewEditMessageReplyMarkup(msg.Chat.ID, targetMsgID, stopButton(targetMsgID))
@@ -97,6 +98,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Sử dụng stdbuf để bắt log ngay lập tức
 	cmd := exec.CommandContext(ctx, "sh", "-c", "stdbuf -oL -eL "+cmdStr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -108,7 +110,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	activeProcs[targetMsgID] = pInfo
 	procsMu.Unlock()
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	readToLogs := func(r io.Reader) {
+		defer wg.Done()
 		buf := make([]byte, 1024)
 		for {
 			n, err := r.Read(buf)
@@ -116,10 +122,11 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				cleanStr := ansiRegex.ReplaceAllString(string(buf[:n]), "")
 				pInfo.Mu.Lock()
 				pInfo.Logs.WriteString(cleanStr)
-				if pInfo.Logs.Len() > 4096 {
+				// Giới hạn log tránh tràn message Telegram
+				if pInfo.Logs.Len() > 3800 {
 					current := pInfo.Logs.String()
 					pInfo.Logs.Reset()
-					pInfo.Logs.WriteString(current[len(current)-4096:])
+					pInfo.Logs.WriteString(current[len(current)-3800:])
 				}
 				pInfo.Mu.Unlock()
 			}
@@ -137,9 +144,8 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) // Cập nhật nhanh hơn (2s thay vì 10s)
 	defer ticker.Stop()
-
 	stopTicker := make(chan bool)
 
 	go func() {
@@ -151,16 +157,14 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				currentLog := formatLiveLog(logData)
 				pInfo.Mu.Unlock()
 
-				if currentLog != "" {
-					content := fmt.Sprintf("<pre>%s\n\n%s</pre>",
-						html.EscapeString(cmdStr), html.EscapeString(currentLog))
+				content := fmt.Sprintf("<b>Cmd:</b> <code>%s</code>\n<pre>%s</pre>",
+					html.EscapeString(cmdStr), html.EscapeString(currentLog))
 
-					edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, content)
-					edit.ParseMode = "HTML"
-					markup := stopButton(targetMsgID)
-					edit.ReplyMarkup = &markup
-					bot.Send(edit)
-				}
+				edit := tgbotapi.NewEditMessageText(msg.Chat.ID, targetMsgID, content)
+				edit.ParseMode = "HTML"
+				markup := stopButton(targetMsgID)
+				edit.ReplyMarkup = &markup
+				bot.Send(edit)
 			case <-stopTicker:
 				return
 			}
@@ -168,6 +172,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}()
 
 	_ = cmd.Wait()
+	wg.Wait() // Đợi toàn bộ log được đọc xong từ Pipe trước khi đóng
 	stopTicker <- true
 
 	procsMu.Lock()
@@ -175,10 +180,16 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	procsMu.Unlock()
 
 	pInfo.Mu.Lock()
-	finalLog := formatLiveLog(pInfo.Logs.String())
+	finalLog := pInfo.Logs.String()
+	if finalLog == "" {
+		finalLog = "Command finished with no output."
+	} else {
+		// Lấy đoạn log cuối cùng cho gọn, hoặc để nguyên tùy nhu cầu
+		finalLog = formatLiveLog(finalLog)
+	}
 	pInfo.Mu.Unlock()
 
-	finalText := fmt.Sprintf("<pre>%s\n\n%s</pre>",
+	finalText := fmt.Sprintf("<b>Done:</b> <code>%s</code>\n<pre>%s</pre>",
 		html.EscapeString(cmdStr), html.EscapeString(finalLog))
 
 	editMsg(bot, msg.Chat.ID, targetMsgID, finalText, false)
@@ -199,7 +210,7 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	defer out.Close()
 
 	io.Copy(out, resp.Body)
-	reply(bot, msg.Chat.ID, msg.Document.FileName)
+	reply(bot, msg.Chat.ID, "Saved file: "+msg.Document.FileName)
 }
 
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -211,16 +222,16 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		if ok && pInfo.Cmd != nil && pInfo.Cmd.Process != nil {
 			syscall.Kill(-pInfo.Cmd.Process.Pid, syscall.SIGKILL)
 			pInfo.Cancel()
-			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel..."))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Process Terminated."))
 		} else {
-			bot.Request(tgbotapi.NewCallback(query.ID, "Cancel"))
+			bot.Request(tgbotapi.NewCallback(query.ID, "Process not found or finished."))
 		}
 	}
 }
 
 func stopButton(msgID int) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("Cancel", fmt.Sprintf("stop_%d", msgID)),
+		tgbotapi.NewInlineKeyboardButtonData("⏹ Stop", fmt.Sprintf("stop_%d", msgID)),
 	))
 }
 
